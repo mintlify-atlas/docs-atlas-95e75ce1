@@ -1,7 +1,7 @@
 ---
 title: "Architecture Rules and Patterns for Brave Core C++"
 sidebarTitle: "Architecture"
-description: "Brave Core enforces Chromium's layer hierarchy with additional rules: no bag-of-stuff objects, internal feature guards, DependsOn factories, and abstract base classes for cross-layer access."
+description: "Brave Core enforces Chromium's layer hierarchy with no bag-of-stuff objects, internal feature guards, DependsOn factories, and cross-layer interfaces."
 ---
 
 Brave Core inherits and extends Chromium's architectural constraints. Code that violates the dependency layer hierarchy, passes oversized "bag-of-stuff" objects, or reaches for global state from the wrong layer will fail code review. This page documents the most important enforced rules with the real code examples from the source that justify each one.
@@ -136,21 +136,18 @@ MyServiceFactory::MyServiceFactory()
 </Accordion>
 
 <Accordion title="ARCH-012: Return Null for Incognito Profiles">
-**If a service shouldn't be active in incognito, return null from `GetBrowserContextToUse`.** Never initialise services for profile types they shouldn't support.
+**If a service shouldn't be active in incognito, return null from the static `GetForProfile` accessor rather than overriding `GetBrowserContextToUse`.** Never initialise services for profile types they shouldn't support.
+
+The `GetBrowserContextToUse` override (used in `ARCH-015`) controls construction-time gating. For incognito, the preferred pattern is a null guard in `GetForProfile`:
 
 ```cpp
-// ❌ WRONG — returns the profile even for incognito
-content::BrowserContext* GetBrowserContextToUse(
-    content::BrowserContext* context) const override {
-  return context;  // Creates services for incognito!
-}
-
-// ✅ CORRECT — return null for unsupported profiles
-content::BrowserContext* GetBrowserContextToUse(
-    content::BrowserContext* context) const override {
-  if (context->IsOffTheRecord())
+// ✅ CORRECT — null guard in the static accessor
+// static
+MyService* MyServiceFactory::GetForProfile(Profile* profile) {
+  if (profile->IsOffTheRecord())
     return nullptr;
-  return context;
+  return static_cast<MyService*>(
+      GetInstance()->GetServiceForBrowserContext(profile, true));
 }
 ```
 </Accordion>

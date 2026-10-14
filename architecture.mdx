@@ -1,5 +1,5 @@
 ---
-title: "Brave Core Architecture and Code Organization"
+title: "Brave Core Architecture and Code Organization Guide"
 sidebarTitle: "Architecture"
 description: "How Brave Core follows Chromium's strict dependency layering model, where brave/browser is the embedder and brave/components mirrors //components rules."
 ---
@@ -165,7 +165,7 @@ Every feature must be scoped to exactly one of four ownership primitives. Choose
 
 | Scope | Owner | Examples |
 |---|---|---|
-| **Tab** | `BraveTabFeatures` | Find-in-page, print preview, page actions |
+| **Tab** | `TabFeatures` (`BraveTabFeatures`) | Find-in-page, print preview, page actions |
 | **Browser Window** | `BrowserWindowFeatures` | Omnibox, bookmarks bar, vertical tabs |
 | **Profile** | `BrowserContextKeyedServiceFactory` | Rewards, Wallet, sync services |
 | **Global** | `GlobalFeatures` | Process-wide features spanning profiles |

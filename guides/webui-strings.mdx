@@ -1,7 +1,7 @@
 ---
-title: "Adding and Managing Strings in Brave WebUI"
+title: "Adding and Managing Localized Strings in Brave WebUI"
 sidebarTitle: "WebUI Strings"
-description: "How Brave's .grdp string pipeline works: adding strings with formatter_data, auto-generated TypeScript enums, the global S alias, and localization in upstream Chromium UIs."
+description: "How Brave's .grdp string pipeline works: formatter_data attributes, auto-generated TypeScript enums, the global S alias, and upstream Chromium UI support."
 ---
 
 Brave extends the standard Chromium `grit` localization tool with the ability to automatically generate TypeScript bindings and enums from `.grdp` string definitions. This removes error-prone hard-coded string-key strings from UI code and replaces them with type-safe TypeScript enum values that the compiler can verify at build time.

@@ -1,5 +1,5 @@
 ---
-title: "Clone and Initialize the Brave Core Repository"
+title: "How to Clone and Initialize the Brave Core Repository"
 sidebarTitle: "Clone & Init"
 description: "How to clone brave-core into the correct src/brave path, run pnpm run init to download Chromium, apply patches, and prepare the build environment."
 ---
@@ -87,7 +87,7 @@ Some features require API keys or additional configuration files before the brow
 Once the repository is initialized you will use `pnpm run sync` (rather than `init`) to update your checkout. Understanding its flags is important for day-to-day development:
 
 ```bash
-pnpm run sync [--force] [--init] [--create] [--sync_chromium=true|false] [-D] [brave_core_ref]
+pnpm run sync [--force] [--init] [--sync_chromium=true|false] [-D] [brave_core_ref]
 ```
 
 | Flag | Effect |

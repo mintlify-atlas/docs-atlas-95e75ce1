@@ -1,7 +1,7 @@
 ---
 title: "C++ Coding Standards and Style Guide for Brave Core"
 sidebarTitle: "Coding Standards"
-description: "Brave Core enforces IWYU, positive boolean naming, Maybe* prefixes, anonymous namespaces, platform buildflag usage, and strict logging and CHECK discipline across all C++ code."
+description: "Brave Core enforces IWYU, positive boolean naming, Maybe* prefixes, anonymous namespaces, BUILDFLAG splits, and CHECK/logging discipline in C++."
 ---
 
 Brave Core follows Chromium's C++ style guide and adds its own layer of enforced conventions. Code review checks for IWYU compliance, naming consistency across C++/JS/prefs layers, correct use of `CHECK` vs `DCHECK` vs `NOTREACHED`, and proper platform-split patterns. This page collects the most frequently enforced standards with the source examples used to justify them.

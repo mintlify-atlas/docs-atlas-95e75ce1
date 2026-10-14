@@ -1,7 +1,7 @@
 ---
-title: "Integrating Rust Code into Brave Core"
+title: "Integrating Rust Code into Brave Core via cxx.rs FFI"
 sidebarTitle: "Rust Integration"
-description: "Rules, approval process, and tooling for adding Rust to brave-core: cxx.rs FFI, adblock-rust as a real example, vendoring crates, patching, and reviewer checklist."
+description: "Rules and tooling for adding Rust to brave-core: cxx.rs FFI, the adblock engine as a real example, vendoring crates, patching, and the reviewer checklist."
 ---
 
 Brave Core integrates Rust code for performance-critical components, most notably the adblock engine. Adding Rust to brave-core is possible but involves a formal approval process, strict rules around networking and duplication, and careful use of the cxx.rs FFI layer to bridge between Rust and C++. This page covers everything you need to know before writing or reviewing Rust code in the repository.
@@ -129,10 +129,6 @@ When reviewing a PR that adds or updates Rust code, check all of the following:
 
 ## String Usage Across the FFI Boundary
 
-Passing strings between Rust and C++ requires care. The cxx.rs bridge provides safe string types (`CxxString` and `RustString`) but you must follow the coding standard to avoid copies and lifetime issues. Key rules:
+Passing strings between Rust and C++ requires care. The cxx.rs bridge provides safe string types (`rust::Str`, `rust::String`, and `CxxString`) whose correct use depends on data flow direction (borrow vs. own) and payload size. Choosing the wrong type causes hidden copies or lifetime bugs.
 
-- Prefer passing `&str` (Rust) ↔ `const std::string&` (C++) where the callee only reads the value.
-- Avoid returning owned `String` from Rust to C++ in hot paths — prefer output parameters or pre-allocated buffers.
-- Never transmit raw `*const u8` pointers without an accompanying length.
-
-Full guidance is in the [Rust/C++ FFI string coding standard](https://github.com/brave/brave-core/blob/master/docs/best-practices/coding-standards-apis.md#-string-usage-in-rustc-ffi).
+Full guidance, with worked examples for every direction and size combination, is in the [Rust/C++ FFI string coding standard](https://github.com/brave/brave-core/blob/master/docs/best-practices/coding-standards-apis.md#-string-usage-in-rustc-ffi).

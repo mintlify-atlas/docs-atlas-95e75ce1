@@ -1,7 +1,7 @@
 ---
 title: "Using sources.gni to Avoid Circular GN Dependencies"
 sidebarTitle: "GNI Sources"
-description: "When and how to use sources.gni in brave-core: the circular dependency problem in //chrome/browser, interface/impl patterns, template techniques, and allowed circular include flags."
+description: "Using sources.gni in brave-core: avoiding circular deps in //chrome/browser, interface/impl patterns, template techniques, and circular include flags."
 ---
 
 The `sources.gni` pattern lets Brave add source files directly to upstream GN build targets. It was introduced to resolve circular dependency problems that arise when Brave subclasses are placed in `//brave/browser` but need to be instantiated by `//chrome/browser`. Understanding when this technique is appropriate — and what alternatives are available — is important for keeping the build graph clean as Chromium actively works to break up its large targets.

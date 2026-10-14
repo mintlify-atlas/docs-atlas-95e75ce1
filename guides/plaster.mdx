@@ -1,7 +1,7 @@
 ---
-title: "Plaster: Semantic Patching Engine for Chromium"
+title: "Plaster: Brave Core's Semantic Chromium Patching Tool"
 sidebarTitle: "Plaster"
-description: "Plaster replaces brittle .patch files and viral #define macros with YAML-driven regex and AST rewriters that survive Chromium rebases and communicate intent clearly."
+description: "Plaster replaces brittle .patch files and viral #define macros with declarative YAML rewriters that anchor on code structure and survive rebases cleanly."
 ---
 
 Plaster is Brave Core's semantic patching engine — an experimental but actively used tool that applies targeted changes to upstream Chromium source files through a declarative YAML format. Unlike raw `.patch` files, which anchor on surrounding context lines and break whenever those lines shift, Plaster rewriters anchor on meaningful constructs: function names, class members, enum entries, and import statements. Unlike `#define` macro tricks, Plaster substitutions are scoped to exactly the occurrence they describe and are visible as generated patch files in the repository.

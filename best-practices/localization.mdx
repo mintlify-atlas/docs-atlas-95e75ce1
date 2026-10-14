@@ -1,10 +1,10 @@
 ---
-title: "Localization and String Management in Brave Core"
+title: "Localization and String Resource Management in Brave Core"
 sidebarTitle: "Localization"
-description: "Brave Core l10n workflow: GRD/GRDP conventions, WebUI bindings, placeholder formatting, Transifex pipeline, and upstream string override patterns."
+description: "Brave Core l10n workflow: GRD/GRDP conventions, WebUI string bindings, placeholder formatting, upstream override patterns, and string quality rules."
 ---
 
-Brave Core ships in over 30 languages. All user-facing strings flow through Chromium's GRIT toolchain — defined in `.grd` and `.grdp` resource files, extracted by the Transifex pipeline, and injected into the browser at build time. The guidelines below cover the complete workflow: adding strings to the right file, formatting placeholders correctly, wiring strings into WebUI, overriding upstream strings without touching upstream files, and keeping the translation cost low by avoiding unused or poorly-described strings.
+Brave Core ships in many languages. All user-facing strings flow through Chromium's GRIT toolchain — defined in `.grd` and `.grdp` resource files and injected into the browser at build time. The guidelines below cover the complete workflow: adding strings to the right file, formatting placeholders correctly, wiring strings into WebUI, overriding upstream strings without touching upstream files, and keeping the translation cost low by avoiding unused or poorly-described strings.
 
 ## The Fundamental Rule: Never Modify Upstream GRD/GRDP Files
 

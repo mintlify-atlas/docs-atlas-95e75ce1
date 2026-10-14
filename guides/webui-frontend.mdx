@@ -1,7 +1,7 @@
 ---
 title: "Building WebUI with React, TypeScript, and Webpack in Brave"
 sidebarTitle: "WebUI Frontend"
-description: "A deep dive into Brave's React/TypeScript/Webpack WebUI stack: file layout, Storybook setup, state management with createInterfaceApi, and mojom-backed React hooks."
+description: "Brave's React/TypeScript/Webpack WebUI stack: file layout, Storybook setup, state management with createInterfaceApi, and mojom-backed React hooks."
 ---
 
 Brave's browser UI pages use a modern frontend stack that is intentionally different from Chromium's Polymer/Lit approach. Most Brave-specific WebUI is built with TypeScript, React, Webpack, Storybook for interactive development, and Jest for unit testing. This stack lives primarily under `components/*/resources/`, `components/*_ui/`, and `browser/ui/webui/resources/`, with shared Webpack configuration in `components/webpack/`.

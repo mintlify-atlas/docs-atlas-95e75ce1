@@ -1,7 +1,7 @@
 ---
-title: "Adapting Upstream Chromium Tests for Brave"
+title: "Adapting Upstream Chromium Tests for the Brave Codebase"
 sidebarTitle: "Chromium Tests"
-description: "Two key mechanisms for making Chromium tests pass in Brave: CurrentTestVendor guards in production code and BraveChromeTestSetupHelper for per-pattern feature adjustments."
+description: "Making Chromium tests pass in Brave: CurrentTestVendor guards in production code and BraveChromeTestSetupHelper for toggling features by test name pattern."
 ---
 
 When Brave overrides or extends Chromium production code, existing upstream tests may begin to fail because the behavior they assert has changed. Rather than disabling or deleting those tests, Brave provides two targeted mechanisms that let you conditionally adjust logic — either in production code or in the test environment itself — so the tests continue to pass under both the Chromium and Brave test runners.

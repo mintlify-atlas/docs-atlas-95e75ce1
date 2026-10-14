@@ -1,7 +1,7 @@
 ---
-title: "Overriding Upstream Chromium WebUI Components"
+title: "Overriding Upstream Chromium WebUI Components in Brave"
 sidebarTitle: "WebUI Overrides"
-description: "Strategies for modifying Chromium's Lit and Polymer WebUI: chromium_src file overrides, Lit function/property patching, lit-mangler for HTML templates, and adding new build targets."
+description: "Modifying Chromium's Lit and Polymer WebUI: chromium_src overrides, Lit function/property patching, lit-mangler for templates, and new build targets."
 ---
 
 Brave ships with a number of modified versions of Chromium's built-in browser pages, such as the settings screen, new-tab page, and history view. These pages are built with Chromium's Lit or Polymer frameworks, which means Brave cannot simply swap in a React component — instead, a set of targeted override mechanisms allow surgical modifications without forking entire upstream files.
@@ -246,11 +246,10 @@ Brave ships with a number of modified versions of Chromium's built-in browser pa
     **Option 2 — `polymer_overriding` utilities:** Use the helpers in `//brave/ui/webui/resources/polymer_overriding.ts` to surgically patch template elements at runtime without touching the upstream file at all. This is often the least invasive approach and keeps the diff minimal.
 
     ```ts
-    import { addWebUIListener } from 'chrome://resources/js/cr.js'
-    import { registerPolymerTemplateModifications } from
+    import { RegisterPolymerTemplateModifications } from
       '//resources/brave/polymer_overriding.js'
 
-    registerPolymerTemplateModifications({
+    RegisterPolymerTemplateModifications({
       // Key is the Polymer element name
       'settings-ui': (templateContent) => {
         const toolbar = templateContent.querySelector('cr-toolbar')
@@ -300,7 +299,7 @@ When your override needs translated strings, follow the guidance in [WebUI Strin
 | Lit function (prototype) | Yes (file lives in `chromium_src`) |
 | Lit property (subclass + re-register) | Yes (file lives in `chromium_src`) |
 | Lit mangler | Yes (file lives in `chromium_src`) |
-| Polymer `registerPolymerTemplateModifications` | No (Brave-owned file) |
+| Polymer `RegisterPolymerTemplateModifications` | No (Brave-owned file) |
 | New build target + `.gni` patch | Usually no for the Brave target |
 
 <Tip>

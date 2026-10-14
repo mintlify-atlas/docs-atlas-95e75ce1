@@ -1,7 +1,7 @@
 ---
-title: "Customizing Siso for Brave Core Builds"
+title: "Customizing Siso for Brave Core Distributed Builds"
 sidebarTitle: "Siso"
-description: "How brave-core extends Chromium's Siso distributed build system: the redirect_cc handler, chromium_src_inputs, timeout adjustments, filegroup exclusions, and .sisoenv/.sisorc configuration."
+description: "brave-core's Siso extensions: redirect_cc for C++ overrides, chromium_src_inputs for Python actions, remote execution timeouts, and .sisoenv/.sisorc setup."
 ---
 
 Siso is Chromium's distributed build execution system that offloads compilation and other build actions to remote workers, enabling faster builds through caching and parallelism. Brave Core extends Siso to support the `chromium_src/` override mechanism — where Brave files transparently replace upstream Chromium source files — without modifying Chromium's build system itself.

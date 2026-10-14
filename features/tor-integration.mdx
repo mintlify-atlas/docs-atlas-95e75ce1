@@ -4,7 +4,7 @@ sidebarTitle: "Tor Integration"
 description: "How Brave's Tor Private Windows route traffic through the Tor network using a separate browser profile, onion routing, and a bundled Tor client binary."
 ---
 
-Brave ships a fully integrated Tor client on desktop platforms, giving users access to onion routing without installing a separate application. A **Tor Private Window** is a distinct browser profile — isolated from your normal and private windows — in which every network request is routed through the Tor anonymity network. The Tor binary is delivered and updated through Brave's component updater infrastructure, and its lifecycle is managed by a set of C++ service classes in the `brave_shields/tor` component.
+Brave ships a fully integrated Tor client on desktop platforms, giving users access to onion routing without installing a separate application. A **Tor Private Window** is a distinct browser profile — isolated from your normal and private windows — in which every network request is routed through the Tor anonymity network. The Tor binary is delivered and updated through Brave's component updater infrastructure, and its lifecycle is managed by a set of C++ service classes in the `tor` component (`components/tor/`).
 
 <Note>
 Tor Private Windows are available on **desktop platforms only** (Windows, macOS, Linux). The feature is not available on Android or iOS. If `tor.tor_disabled` is set to `true` in local state prefs, the Tor window option is hidden.

@@ -1,7 +1,7 @@
 ---
-title: "Testing Brave WebUI with Jest and TypeScript"
+title: "Testing Brave WebUI Components with Jest and TypeScript"
 sidebarTitle: "WebUI Testing"
-description: "How to write, organize, and run Jest unit tests for Brave's React WebUI pages: test file conventions, mojom mocking patterns, Testing Library usage, and watch mode."
+description: "Writing and running Jest unit tests for Brave's React WebUI: test file conventions, mojom mocking, Testing Library usage, snapshot tests, and watch mode."
 ---
 
 Brave's WebUI pages use Jest for frontend unit testing. These tests are conceptually similar to C++ `unit_tests` — they run in an isolated environment with mocked dependencies and execute very quickly, without needing a browser process. They are distinct from upstream Chromium's Mocha-based `browser_tests`, which run inside a full browser and are better suited for end-to-end verification of Lit/Polymer pages.

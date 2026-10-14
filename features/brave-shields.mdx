@@ -19,7 +19,7 @@ Brave Shields is the built-in content-blocking subsystem that protects users on 
     The `fingerprintingV2` setting gates the Farbling subsystem, which introduces calibrated randomness into canvas, audio, WebGL, font, and screen APIs to make cross-site device identification unreliable.
   </Card>
   <Card title="Cosmetic Filtering" icon="eye-slash">
-    CSS selector–based hiding of ad placeholders that survive request blocking. Controlled via the `cosmeticFilteringV2` content setting with `BLOCK` (third-party only) or `BLOCK_THIRD_PARTY` default.
+    CSS selector–based hiding of ad placeholders that survive request blocking. Controlled via the `cosmeticFilteringV2` content setting. The default is `BLOCK_THIRD_PARTY` (hide third-party cosmetics only); `BLOCK` enables first-party cosmetic filtering as well.
   </Card>
   <Card title="HTTPS Upgrades" icon="lock">
     The `httpsUpgrades` setting drives automatic HTTPS upgrading for navigations, replacing Chromium's HTTPS-First Mode with Brave's own exception-aware service.

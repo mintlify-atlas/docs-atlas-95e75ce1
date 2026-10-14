@@ -1,7 +1,7 @@
 ---
 title: "Privacy-Preserving Subscription Credentials in Brave"
 sidebarTitle: "Premium Privacy"
-description: "How Brave's blind-token credential system lets VPN, Leo, and Search Premium verify subscriptions without linking your payment identity to your service usage."
+description: "How Brave's blind-token credential system lets VPN, Leo, and Search Premium verify subscriptions without linking payment identity to service usage."
 ---
 
 When you subscribe to a Brave premium service — VPN, Leo AI, or Search Premium — the browser needs to prove you have an active subscription each time you use that service. A naïve approach would be to attach your account ID or email to each request, but that would let the service correlate every request to your payment identity. Brave instead uses a **blind token protocol based on Privacy Pass (RFC 9576)** that mathematically decouples who paid from who is using the service.

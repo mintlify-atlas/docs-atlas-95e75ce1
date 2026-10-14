@@ -1,7 +1,7 @@
 ---
 title: "Brave Wallet: Multi-Chain Crypto Wallet Architecture"
 sidebarTitle: "Brave Wallet"
-description: "Brave's built-in multi-chain wallet supports ETH, BTC, SOL, FIL, ZEC, and ADA using ECDSA, EdDSA, BLS12-381, and PBKDF2 inside a layered iOS-compatible component."
+description: "Brave's built-in self-custodial wallet supports ETH, BTC, SOL, FIL, ZEC, and ADA using ECDSA, EdDSA, and PBKDF2 inside a layered iOS-compatible component."
 ---
 
 Brave Wallet is a fully self-custodial, non-custodial cryptocurrency wallet built directly into the browser — no extension required. It supports multiple blockchain networks and their respective cryptographic signature schemes, manages BIP-39 mnemonic key derivation, stores an encrypted keyring locally, and exposes standardized provider APIs (EIP-1193, Solana's wallet standard, and equivalents for Bitcoin, Filecoin, Zcash, and Cardano) to web dApps. The wallet is structured as an iOS-compatible layered component that keeps all sensitive cryptographic operations in a sandboxed `core/` layer never linked against the Content API.

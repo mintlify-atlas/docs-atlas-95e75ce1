@@ -1,7 +1,7 @@
 ---
-title: "Memory Management in Brave Core: Smart Pointers and Ownership"
+title: "Memory Management in Brave Core: Pointers and Ownership"
 sidebarTitle: "Memory"
-description: "Brave Core bans std::shared_ptr, requires raw_ptr/raw_ref for unowned fields, enforces WeakPtr for async callbacks, and uses unique_ptr for ownership transfer throughout C++ code."
+description: "Brave Core bans std::shared_ptr, uses raw_ptr/raw_ref for unowned fields, WeakPtr for async callbacks, and unique_ptr for sole ownership in C++."
 ---
 
 Memory management in Brave Core (and Chromium generally) follows a strict set of rules designed to eliminate use-after-free bugs. The core principle is that **ownership must be unambiguous and expressed through the type system**. `std::shared_ptr` is banned outright. Unowned pointer fields use `raw_ptr<T>` or `const raw_ref<T>`. Async callbacks across object lifetimes use `base::WeakPtr`. This page documents each rule with the canonical code examples from the source.

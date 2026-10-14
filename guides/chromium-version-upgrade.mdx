@@ -1,7 +1,7 @@
 ---
-title: "Upgrading Brave Core to a New Chromium Version"
+title: "How to Upgrade Brave Core to a New Chromium Version"
 sidebarTitle: "Version Upgrade"
-description: "A version bump updates the chrome tag in package.json, resolves patch conflicts with --3way, regenerates all patches, and re-syncs localization strings for the new Chromium release."
+description: "How to bump the Chromium tag in package.json, resolve patch conflicts with --3way, regenerate patches, and re-sync localization strings for a new release."
 ---
 
 Tracking upstream Chromium closely is fundamental to Brave's security posture and feature roadmap. A version bump — updating brave-core to depend on a newer Chromium tag — is a structured process that produces four canonical commit types and requires careful patch conflict resolution. This guide walks through the complete upgrade workflow, the git commands involved, and how to handle the common failure modes.
@@ -68,16 +68,18 @@ git commit -m "Update from Chromium 119.7049.17 to Chromium 120.0.7050.40."
 pnpm run init
 ```
 
-If all patches apply cleanly, skip to [Updating all patches](#step-4-update-all-remaining-patches). If any patches fail, the output lists the affected files:
+If all patches apply cleanly, skip to [Updating all patches](#update-all-remaining-patches). If any patches fail, the output lists the affected files:
 
-```
+```text
 2 failed patches:
 chrome/browser/ui/views/frame/browser_view_layout.cc
+  - Patch applied because: The target file was modified since the patch was last applied.
   - Error - Program git exited with error code 1.
 error: patch failed: chrome/browser/ui/views/frame/browser_view_layout.cc:72
 error: chrome/browser/ui/views/frame/browser_view_layout.cc: patch does not apply
 
 chrome/browser/ui/webui/settings/site_settings_helper.cc
+  - Patch applied because: The target file was modified since the patch was last applied.
   - Error - Program git exited with error code 1.
 error: patch failed: chrome/browser/ui/webui/settings/site_settings_helper.cc:248
 error: chrome/browser/ui/webui/settings/site_settings_helper.cc: patch does not apply
@@ -99,7 +101,7 @@ git -C ../ apply --3way --ignore-space-change --ignore-whitespace \
 
 The output confirms which files received conflict markers:
 
-```
+```text
 Applied patch to 'chrome/browser/ui/views/frame/browser_view_layout.cc' with conflicts.
 U chrome/browser/ui/views/frame/browser_view_layout.cc
 Applied patch to 'chrome/browser/ui/webui/settings/site_settings_helper.cc' with conflicts.

@@ -1,7 +1,7 @@
 ---
 title: "Griffin: Feature Rollouts and A/B Experiments in Brave"
 sidebarTitle: "Griffin"
-description: "Griffin is Brave's Finch: a staged rollout and private A/B experimentation service that controls features without compromising user privacy or telemetry policies."
+description: "Griffin is Brave's Finch: staged rollouts, private A/B experiments, and remote config updates — all open source, P3A-only telemetry."
 ---
 
 Griffin is Brave's implementation of Chromium's Finch variations service — a backend that lets Brave progressively enable features, run private statistical experiments, and push configuration parameter changes to browsers in the field. Every study definition is open source, seed fetches are served through a CDN that never persists logs, and experiment reporting is restricted exclusively to P3A (Privacy-Preserving Product Analytics). Users who disable P3A opt out of all experiment reporting.
@@ -124,10 +124,7 @@ Follow this lifecycle to ship a feature safely via Griffin.
   <Step title="Enable on Nightly / Beta via Griffin">
     Open a PR in the `brave-variations` repository and test it locally before merging:
 
-    ```bash
-    # Test your PR's seed locally (replace 1234 with your PR number)
-    pnpm start --variations-pr=1234
-    ```
+    Launch Brave with the `--variations-pr=1234` flag (replace `1234` with your PR number) to load the seed from that pull request locally.
 
     Always land on Nightly first, then Beta.
   </Step>

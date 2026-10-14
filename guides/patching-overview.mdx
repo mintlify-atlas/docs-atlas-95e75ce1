@@ -1,7 +1,7 @@
 ---
-title: "Patching Chromium: Strategy and Best Practices"
+title: "Patching Upstream Chromium: Strategy and Best Practices"
 sidebarTitle: "Patching Overview"
-description: "Brave Core modifies Chromium through a strict priority order — brave-core internals first, chromium_src overrides second, and direct patches only as a last resort."
+description: "Brave Core uses a strict three-tier order: brave-core internals first, chromium_src overrides second, and direct .patch files only as a last resort."
 ---
 
 One of the primary goals of brave-core is to make changes to Chromium in a way that keeps Chromium rebases fast and low-friction. Because Brave ships frequent updates tightly tracking upstream Chromium versions, every patching decision has long-term maintenance consequences. This guide covers the three-tier patching strategy, when to use each tier, and which override mechanisms are available at each level.

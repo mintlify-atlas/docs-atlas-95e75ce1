@@ -1,7 +1,7 @@
 ---
 title: "Brave VPN: Built-In Privacy-Preserving VPN Service"
 sidebarTitle: "Brave VPN"
-description: "Brave VPN integrates a Privacy Pass credential system that decouples payment identity from VPN usage, supporting IKEv2 and WireGuard on desktop and Android."
+description: "Brave VPN uses a Privacy Pass credential system to decouple payment identity from VPN usage, supporting IKEv2 and WireGuard on desktop and Android."
 ---
 
 Brave VPN is a full-device VPN service built into the Brave browser, powered by Guardian's VPN infrastructure. Beyond standard VPN tunneling, Brave VPN's distinguishing architectural property is its **credential system**: when you connect to the VPN, the VPN endpoint learns only that *some* valid subscriber is connecting — not *who* is connecting. Payment identity and service usage are decoupled using a blind token protocol based on Privacy Pass (RFC 9576). The VPN component runs as a `KeyedService` in the browser process and manages both the connection lifecycle and regional server selection.

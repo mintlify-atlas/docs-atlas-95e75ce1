@@ -1,7 +1,7 @@
 ---
 title: "Using chromium_src Overrides to Modify Upstream Chromium"
 sidebarTitle: "chromium_src"
-description: "The chromium_src directory intercepts Chromium compilation at the file level, letting you replace, wrap, or extend any upstream header or source without a patch file."
+description: "How Brave uses chromium_src to shadow upstream files at compile time, enabling C++, Mojom, GN, and TypeScript overrides without any .patch files."
 ---
 
 The `chromium_src` override system is the primary mechanism Brave Core uses to modify upstream Chromium behavior. Files placed in `src/brave/chromium_src/` are prioritized over their counterparts in the Chromium source tree during compilation, allowing targeted replacements, subclass injections, function wraps, and interface extensions — all without generating `.patch` files. This page explains how each override pattern works and when to reach for each one.

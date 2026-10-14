@@ -1,7 +1,7 @@
 ---
 title: "Cryptographic Primitives and Protocols Used by Brave"
 sidebarTitle: "Cryptography"
-description: "A reference to every cryptographic scheme Brave employs beyond standard TLS — from blind tokens and HPKE to BLS12-381 wallet keys and P3A's STAR protocol."
+description: "Every cryptographic scheme Brave adds beyond standard TLS — blind tokens, HPKE, BLS12-381 wallet keys, and the STAR protocol for private analytics."
 ---
 
 Every Chromium-based browser inherits standard TLS 1.3, certificate verification, and HKDF-based session-key derivation from the underlying network stack. Brave adds a second layer of applied cryptography to protect users' identities when they interact with Brave's own services. This page documents each distinct cryptographic feature, the specific algorithm or protocol it uses, which platforms it applies to, and why it was chosen.
