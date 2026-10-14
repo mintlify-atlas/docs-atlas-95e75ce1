@@ -1,0 +1,142 @@
+---
+title: "Using sources.gni to Avoid Circular GN Dependencies"
+sidebarTitle: "GNI Sources"
+description: "When and how to use sources.gni in brave-core: the circular dependency problem in //chrome/browser, interface/impl patterns, template techniques, and allowed circular include flags."
+---
+
+The `sources.gni` pattern lets Brave add source files directly to upstream GN build targets. It was introduced to resolve circular dependency problems that arise when Brave subclasses are placed in `//brave/browser` but need to be instantiated by `//chrome/browser`. Understanding when this technique is appropriate — and what alternatives are available — is important for keeping the build graph clean as Chromium actively works to break up its large targets.
+
+## Why Circular Dependencies Arise
+
+Brave routinely subclasses upstream Chromium types. For example, `BraveContentBrowserClient` (in `//brave/browser`) subclasses `ChromeContentBrowserClient` (in `//chrome/browser`). The circular dependency appears like this:
+
+1. `BraveContentBrowserClient` lives in `//brave/browser` and depends on `//chrome/browser` for its base class.
+2. `//chrome/browser` needs to instantiate `BraveContentBrowserClient` instead of `ChromeContentBrowserClient`, so it now depends on `//brave/browser`.
+3. Both targets now depend on each other — a cycle that `gn check` and `checkdeps` reject.
+
+The historical fix was to use `sources.gni` to merge `BraveContentBrowserClient`'s source files directly into the `//chrome/browser` target, eliminating the separate target boundary. This keeps both classes in the same GN target so there is no cross-target dependency.
+
+## When to Use `sources.gni`
+
+<CardGroup cols={2}>
+  <Card title="Generally acceptable" icon="check">
+    Adding **dependencies** and other non-source configuration (e.g., `deps +=`) to upstream targets via `.gni` is broadly acceptable.
+  </Card>
+  <Card title="Avoid for //chrome/browser sources" icon="x">
+    Adding **source files** to `//chrome/browser` or `//chrome/browser/ui` via `sources.gni` should be avoided. Use one of the methods below instead.
+  </Card>
+  <Card title="Small targets elsewhere" icon="minus">
+    Adding a very small number of source files to upstream targets **outside** `//chrome/browser` may be appropriate when no reasonable alternative exists.
+  </Card>
+  <Card title="Prefer alternatives first" icon="lightbulb">
+    Always consider the interface/impl pattern, template technique, or `allow_circular_includes_from` before reaching for `sources.gni` for source files.
+  </Card>
+</CardGroup>
+
+<Warning>
+Chromium is actively working to break up `//chrome/browser` and `//chrome/browser/ui` into smaller targets. Adding source files to these targets via `sources.gni` makes that refactoring harder. Do not add to the problem — use one of the patterns below.
+</Warning>
+
+## Methods to Break Circular Dependencies
+
+### Interface / Implementation Pattern
+
+The cleanest long-term solution is to separate the interface (header) from the implementation (source) and put each in a different GN target at an appropriate level.
+
+The pattern works as follows:
+- A `:tabs_public` target in `//chrome/browser/ui/tabs` contains the public headers that both Chrome and Brave depend on.
+- A `:impl` target contains implementation files that can depend on higher-level browser targets without creating cycles.
+- `//chrome/browser` includes the `:impl` target to ensure it is linked into the final binary.
+
+See the upstream Chromium source for a working example:
+- [`tabs:tabs_public`](https://source.chromium.org/chromium/chromium/src/+/main:chrome/browser/ui/tabs/BUILD.gn;l=12)
+- [`tabs:impl`](https://source.chromium.org/chromium/chromium/src/+/main:chrome/browser/ui/tabs/BUILD.gn;l=300)
+- [`//chrome/browser impl dependency`](https://source.chromium.org/chromium/chromium/src/+/main:chrome/browser/BUILD.gn;l=4378)
+
+Chromium iOS also provides good models for this pattern and is worth studying.
+
+### Template Technique
+
+When the subclass only needs to extend the upstream class without the upstream target needing to name the subclass explicitly, a C++ template removes the dependency entirely:
+
+```cpp
+// brave_class.h
+template <typename ChromeClass>
+class BraveClass : public ChromeClass {
+  // Brave-specific overrides here
+};
+```
+
+The upstream target instantiates `ChromeClass` normally. The `chromium_src` override replaces the instantiation with a macro that injects `BraveClass`:
+
+```cpp
+// some_chromium_source.cc (original)
+chrome_class_ = std::make_unique<ChromeClass>();
+```
+
+```cpp
+// chromium_src/some_chromium_source.cc
+#define ChromeClass BraveClass<ChromeClass>()
+```
+
+Because `BraveClass` is a template, the upstream target only needs a dependency on the header, not a full source file. The chrome target that performs the override gains a dependency on the Brave target, but there is no cycle.
+
+### `Recipes for Breaking Chrome Dependencies`
+
+For additional patterns (layering violations, component extraction, etc.) see the upstream Chromium cookbook:
+- [Recipes for Breaking Chrome Dependencies](https://www.chromium.org/developers/design-documents/cookbook/#recipes-for-breaking-chrome-dependencies)
+- [Dependency Inversion](https://www.chromium.org/developers/design-documents/cookbook/#dependency-inversion)
+
+## Allowed Circular Include Flags (Last Resort)
+
+When a circular dependency in `//chrome/browser` or `//chrome/browser/ui` cannot be resolved by any of the methods above, you may temporarily use the special allow-list flags to split sources into smaller targets that can be resolved later:
+
+- `brave_chrome_browser_allow_circular_includes_from`
+- `brave_chrome_browser_ui_allow_circular_includes_from`
+
+These flags are defined in the upstream `//chrome/browser` and `//chrome/browser/ui` `BUILD.gn` files respectively. See working examples at:
+- [`//chrome/browser` allow list](https://source.chromium.org/chromium/chromium/src/+/main:chrome/browser/BUILD.gn;l=3524)
+- [`//chrome/browser/ui` allow list](https://source.chromium.org/chromium/chromium/src/+/main:chrome/browser/ui/BUILD.gn;l=5752)
+- [brave-core PR converting from sources.gni](https://github.com/brave/brave-core/pull/25892/files)
+
+<Warning>
+Never use `check_includes = false` to silence errors about circular includes. This hides the problem rather than resolving it and makes future refactoring harder.
+</Warning>
+
+## Decision Tree
+
+```
+Do you need to add source files to an upstream target?
+│
+├── Is it //chrome/browser or //chrome/browser/ui?
+│   ├── Can you use the interface/impl pattern?  → YES: Use it
+│   ├── Can you use the template technique?      → YES: Use it
+│   └── Neither works?
+│       └── Use brave_chrome_browser_allow_circular_includes_from
+│           (and file an issue to clean it up later)
+│
+└── Is it another upstream target?
+    ├── Can you avoid it entirely?               → YES: Avoid it
+    ├── Is it a very small number of files?      → YES: sources.gni may be ok
+    └── Larger change?
+        └── Consider interface/impl or template  → Prefer those first
+```
+
+## Adding Dependencies (Always OK)
+
+Using `sources.gni` to add `deps`, `public_deps`, or other non-source configuration to upstream targets is generally acceptable and does not create the same problems as adding source files:
+
+```gni
+# brave/browser/brave_browser_sources.gni
+brave_browser_extra_deps = [
+  "//brave/components/brave_shields/browser",
+]
+```
+
+```gn
+# chromium_src/chrome/browser/BUILD.gn
+import("//brave/browser/brave_browser_sources.gni")
+
+# Appended to the upstream target's deps list
+deps += brave_browser_extra_deps
+```

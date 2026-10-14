@@ -1,0 +1,102 @@
+---
+title: "Clone and Initialize the Brave Core Repository"
+sidebarTitle: "Clone & Init"
+description: "How to clone brave-core into the correct src/brave path, run pnpm run init to download Chromium, apply patches, and prepare the build environment."
+---
+
+Brave Core cannot simply be cloned anywhere on your filesystem — it must be checked out at a very specific path relative to its parent project folder. This constraint exists because the Chromium build system (`gn` and `gclient`) expects all source trees to sit under a single `src/` root, and `brave-core` is the subtree at `src/brave`. Getting the path wrong will cause `gn` to fail when it tries to resolve inter-repository dependencies.
+
+## Clone the Repository
+
+Create a parent folder for your project and clone `brave-core` directly into `src/brave` within it:
+
+```bash
+# Replace "brave-browser" with any folder name you prefer
+git clone git@github.com:brave/brave-core.git brave-browser/src/brave
+cd brave-browser/src/brave
+```
+
+After cloning, your on-disk layout should look like this:
+
+```text
+brave-browser/          ← your project root (any name)
+└── src/
+    └── brave/          ← the brave-core checkout
+        ├── browser/
+        ├── components/
+        ├── chromium_src/
+        ├── docs/
+        ├── package.json
+        └── ...
+```
+
+The Chromium source tree (`src/`) does **not** exist yet — it will be downloaded during the initialization step.
+
+<Warning>
+  Never clone `brave-core` into a path other than `<project_root>/src/brave`. Chromium's `gclient` and `gn` tools resolve `//` paths relative to the `src/` directory, and an incorrect checkout location will produce confusing build failures.
+</Warning>
+
+## Initialize the Build Environment
+
+The initialization step does several things in sequence:
+
+1. Runs `pnpm install --frozen-lockfile` to install Node.js build-script dependencies.
+2. Downloads the Chromium source tree at the commit pinned in `package.json` (currently Chromium `156.0.8078.25`).
+3. Runs `gclient sync` to fetch all sub-dependencies declared in `src/brave/DEPS`.
+4. Applies Brave's `.patch` files on top of the Chromium source.
+5. Runs `gclient runhooks` (compiles code generation tools, downloads prebuilt binaries, etc.).
+
+Because it downloads tens of gigabytes of Chromium history and source, **the first `init` can take anywhere from 30 minutes to several hours** depending on your internet connection and storage speed.
+
+<CodeGroup>
+  ```bash Desktop (Linux / macOS / Windows)
+  # From inside src/brave:
+  pnpm run init
+  ```
+
+  ```bash Android (arm)
+  # Replace arm with arm64, x86, or x64 as needed:
+  pnpm run init --target_os=android --target_arch=arm
+  ```
+
+  ```bash iOS
+  pnpm run init --target_os=ios
+  ```
+</CodeGroup>
+
+<Tip>
+  If your internet connection is unreliable, you can run `pnpm run init` again after an interruption — it is idempotent and will resume from where it left off rather than re-downloading everything.
+</Tip>
+
+## What `init` Does Under the Hood
+
+The `init` script in `package.json` maps to:
+
+```json
+"init": "pnpm install --frozen-lockfile --yes && node ./build/commands/scripts/sync.ts --init"
+```
+
+Passing `--init` to `sync.ts` triggers the "force" variant of the sync: it resets both `brave-core` and the Chromium checkout to the exact versions specified in `package.json`, forces all patches to be reapplied, and force-updates all child dependencies declared in `DEPS`. This is the same as running `pnpm run sync --init` at any later point.
+
+## Additional Build Configuration
+
+Some features require API keys or additional configuration files before the browser will fully function. See the [Build configuration](https://github.com/brave/brave-browser/wiki/Build-configuration) wiki page for details. Brave employees should also consult the [internal build configuration](https://github.com/brave/internal/wiki/Build-configuration) page.
+
+## pnpm run sync Flags Reference
+
+Once the repository is initialized you will use `pnpm run sync` (rather than `init`) to update your checkout. Understanding its flags is important for day-to-day development:
+
+```bash
+pnpm run sync [--force] [--init] [--create] [--sync_chromium=true|false] [-D] [brave_core_ref]
+```
+
+| Flag | Effect |
+|---|---|
+| *(no flags)* | Updates Chromium only if its pinned version changed, then re-applies only the patches that changed. Updates child deps only if any project was updated. **Use this for day-to-day syncing.** |
+| `--force` | Forces both Chromium and `brave-core` to the latest remote commit of the current branch and the Chromium ref in `package.json`. Re-applies **all** patches. Force-updates all child deps. **Use this when your tree is broken and you need a known-good state.** |
+| `--init` | Same as `pnpm run init` — force-updates everything to the versions in `package.json`. Will result in a longer build. **Removes any pending changes in your `brave-core` working directory.** |
+| `--sync_chromium=true\|false` | Force or skip the Chromium version update. Useful to defer a Chromium update when not ready for the longer build time. A warning is printed; your build may fail if the Chromium version is wrong. |
+| `-D` / `--delete_unused_deps` | Deletes any dependencies removed since the last sync (mirrors `gclient sync -D`). |
+| `brave_core_ref` | Checks out the specified `brave-core` ref (tag or branch) and updates all dependent repos including Chromium if needed. |
+
+Once `init` completes successfully, proceed to [Build](/getting-started/build).

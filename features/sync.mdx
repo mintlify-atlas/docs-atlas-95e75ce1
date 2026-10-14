@@ -1,0 +1,178 @@
+---
+title: "Brave Sync: End-to-End Encrypted Cross-Device Sync"
+sidebarTitle: "Sync"
+description: "Brave Sync v2 uses a passphrase-derived encryption key so that synced data — bookmarks, history, passwords, and settings — is never readable by Brave's servers."
+---
+
+Brave Sync v2 is a cross-device synchronization system built on Chromium's sync engine but with a fundamental privacy difference: all synced data is end-to-end encrypted before it ever leaves the device. Brave's servers store only ciphertext and have no way to read bookmarks, browsing history, passwords, or settings. The encryption key is derived entirely from a sync passphrase (or sync code) that stays on the user's devices and is never transmitted to Brave.
+
+## Architecture Overview
+
+Brave Sync reuses Chromium's sync protocol infrastructure for transport and conflict resolution, but replaces the Google-controlled key management layer with a local, passphrase-based scheme.
+
+```
+Device A                      Brave Sync Server              Device B
+────────                      ─────────────────              ────────
+Sync engine                   Stores encrypted blobs         Sync engine
+  │                           No key access                    │
+  │  encrypt(data, key)                                        │  decrypt(blob, key)
+  └──────────────────── encrypted blob ──────────────────────►│
+                                                               └─► local data
+```
+
+The sync key never reaches the server. Data types are serialized to protobuf, encrypted with AES-256, and uploaded as opaque blobs. The server acts as a dumb relay: it stores, timestamps, and delivers version-stamped blobs but cannot inspect their contents.
+
+## The `brave_sync` Component
+
+All sync-specific logic lives in `components/brave_sync/`.
+
+```
+components/brave_sync/
+├── brave_sync_prefs.{cc,h}         # Pref storage: encrypted seed, sync URL
+├── features.{cc,h}                 # Feature flags: kBraveSync, kBraveSyncDefaultPasswords
+├── time_limited_words.{cc,h}       # Passphrase words with expiry timestamps
+├── qr_code_data.{cc,h}             # QR code payload for mobile chain-joining
+├── qr_code_validator.{cc,h}        # Validates scanned QR payloads
+├── sync_service_impl_helper.{cc,h} # Helpers for SyncServiceImpl override
+├── brave_sync_p3a.{cc,h}           # P3A metrics for sync usage
+├── network_time_helper.{cc,h}      # Network time for code expiry checks
+└── crypto/                         # Key derivation and encryption utilities
+```
+
+Feature availability is gated behind two `base::Feature` flags:
+
+```cpp
+// From components/brave_sync/features.h
+namespace brave_sync {
+namespace features {
+
+BASE_DECLARE_FEATURE(kBraveSync);
+BASE_DECLARE_FEATURE(kBraveSyncDefaultPasswords);
+
+}  // namespace features
+}  // namespace brave_sync
+```
+
+## Sync Chain Creation and Joining
+
+A **sync chain** is a named group of devices that share the same encryption key. Creating or joining a chain is always initiated by the user — there is no server-side account to create.
+
+<Tabs>
+  <Tab title="24-Word Passphrase">
+    Brave generates a 24-word mnemonic code from the encryption key. The words are time-limited: each code carries an expiry timestamp so that a code shared insecurely cannot be replayed indefinitely.
+
+    ```cpp
+    // From components/brave_sync/time_limited_words.h
+    class TimeLimitedWords {
+     public:
+      enum class ValidationStatus {
+        kValid = 0,
+        kNotValidPureWords = 1,
+        kVersionDeprecated = 2,
+        kExpired = 3,
+        kValidForTooLong = 4,
+        kWrongWordsNumber = 5,
+      };
+
+      // Generate a time-stamped word code from a raw sync seed
+      static base::expected<std::string, GenerateResult> GenerateForNow(
+          const std::string& pure_words);
+
+      // Validate and extract the raw seed from a time-limited code
+      static base::expected<std::string, ValidationStatus> Parse(
+          const std::string& time_limited_words);
+    };
+    ```
+  </Tab>
+  <Tab title="QR Code">
+    Mobile devices can join a sync chain by scanning a QR code. The QR payload is a JSON object containing the sync code hex and a `not_after` timestamp to limit the window of validity.
+
+    ```cpp
+    // From components/brave_sync/qr_code_data.h
+    class QrCodeData {
+     public:
+      static constexpr int kCurrentQrCodeDataVersion = 2;
+      // QR codes expire after 30 minutes by default
+      static constexpr int kMinutesFromNowForValidCode = 30;
+
+      int version;
+      std::string sync_code_hex;
+      base::Time not_after;
+
+      static std::unique_ptr<QrCodeData> CreateWithActualDate(
+          const std::string& sync_code_hex);
+
+      std::string ToJson();
+      static std::unique_ptr<QrCodeData> FromJson(const std::string& json_string);
+    };
+    ```
+  </Tab>
+</Tabs>
+
+## Encrypted Seed Storage
+
+The sync seed — the raw bytes from which all encryption keys are derived — is stored on-device using the platform's OS-level encryption (`OSCrypt`). The `Prefs` class in `brave_sync_prefs.h` manages all persistent state.
+
+```cpp
+// From components/brave_sync/brave_sync_prefs.h
+class Prefs {
+ public:
+  explicit Prefs(PrefService* pref_service);
+
+  static void RegisterProfilePrefs(PrefRegistrySimple* registry);
+
+  // Seed stored as an OS-encrypted string; never written in plaintext
+  std::string GetEncryptedSeed() const;
+  void SetEncryptedSeed(const std::string& encrypted_seed);
+
+  // Diagnostics for troubleshooting chain-leave issues
+  void AddLeaveChainDetail(const char* file, int line, const char* func);
+  std::string GetLeaveChainDetails() const;
+
+  // Clear all sync state (reset the chain)
+  void Clear();
+};
+
+// Custom sync server URL (enterprise / self-hosted)
+inline constexpr char kCustomSyncServiceUrl[] = "brave_sync.sync_service_url";
+```
+
+<Warning>
+Never log the sync seed, encrypted or otherwise. See the coding standards rule CS-048: sensitive data such as sync seeds, private keys, and credentials must never appear in logs at any log level.
+</Warning>
+
+## Supported Data Types
+
+Brave Sync v2 supports the standard Chromium sync data types, all encrypted end-to-end.
+
+| Data Type | Notes |
+|---|---|
+| **Bookmarks** | Full tree including folders and favicons |
+| **History** | Visit timestamps and page metadata |
+| **Passwords** | Saved login credentials |
+| **Settings / Preferences** | Browser configuration values |
+| **Open Tabs** | Active tab URLs across devices |
+| **Extensions** | Installed extension list |
+| **Themes** | Browser theme selection |
+
+## How Brave Sync Differs from Google Sync
+
+<Accordion title="No server-side key custody">
+Google Sync encrypts data with keys that Google controls unless a custom passphrase is explicitly set. Brave Sync always uses a user-controlled passphrase — Brave never holds any key material.
+</Accordion>
+
+<Accordion title="No Google account required">
+Brave Sync uses a chain code rather than an email address as the identity token. There is no account to create, no email to verify, and no password to forget.
+</Accordion>
+
+<Accordion title="Time-limited join codes">
+Sync chain invitation codes expire (default: 30 minutes for QR codes; passphrase codes carry their own expiry via `TimeLimitedWords`). This limits the window in which a leaked code can be abused.
+</Accordion>
+
+<Accordion title="Custom server support">
+Enterprises and advanced users can point Brave Sync at a self-hosted server using the `brave_sync.sync_service_url` preference, stored as `kCustomSyncServiceUrl`.
+</Accordion>
+
+## P3A Metrics for Sync
+
+The `brave_sync_p3a.{cc,h}` files contain helpers for recording aggregate, privacy-preserving metrics about sync adoption. These metrics are reported through P3A (see the P3A Analytics documentation) and follow the same k-anonymity guarantees — no individual user's sync status is identifiable.

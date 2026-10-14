@@ -1,0 +1,298 @@
+---
+title: "Building WebUI with React, TypeScript, and Webpack in Brave"
+sidebarTitle: "WebUI Frontend"
+description: "A deep dive into Brave's React/TypeScript/Webpack WebUI stack: file layout, Storybook setup, state management with createInterfaceApi, and mojom-backed React hooks."
+---
+
+Brave's browser UI pages use a modern frontend stack that is intentionally different from Chromium's Polymer/Lit approach. Most Brave-specific WebUI is built with TypeScript, React, Webpack, Storybook for interactive development, and Jest for unit testing. This stack lives primarily under `components/*/resources/`, `components/*_ui/`, and `browser/ui/webui/resources/`, with shared Webpack configuration in `components/webpack/`.
+
+## Technology Stack
+
+<CardGroup cols={2}>
+  <Card title="TypeScript & React" icon="react">
+    All Brave WebUI components are authored in TypeScript with React. This gives full type safety across the mojom-to-UI boundary and makes components easily testable and composable.
+  </Card>
+  <Card title="Webpack" icon="box">
+    Webpack bundles TypeScript/React code for each WebUI page. Shared configuration lives in `components/webpack/` and is extended per component.
+  </Card>
+  <Card title="Storybook" icon="book-open">
+    Every WebUI should have a Storybook. CI generates live Storybook links during PRs so designers, reviewers, and engineers can inspect components without building Brave locally.
+  </Card>
+  <Card title="Jest" icon="vial">
+    Unit tests live in sibling `*.test.ts(x)` files next to the file being tested. Run them quickly with `pnpm run test-unit` — no browser required.
+  </Card>
+</CardGroup>
+
+## File Layout
+
+Source files follow a consistent directory convention across all Brave UI components:
+
+```
+components/
+  brave_new_tab_ui/
+    resources/
+      page/
+        components/        ← React component files
+          MyComponent.tsx
+          MyComponent.test.tsx
+          MyComponent.stories.tsx
+        state/             ← API and context files
+          my_feature_context.tsx
+        index.tsx          ← Entry point, imports strings
+        strings.ts         ← WebUI string enum declarations
+browser/
+  ui/
+    webui/
+      resources/           ← Shared WebUI helpers
+components/
+  webpack/                 ← Shared Webpack config
+```
+
+<Note>
+Webpack configuration is shared across all Brave WebUI pages. Per-component overrides extend the base configuration from `components/webpack/`.
+</Note>
+
+## Storybook for Component Development
+
+Every Brave WebUI page must have a Storybook. Storybook enables rapid, hot-reloaded iteration on components without running a full browser build. During pull requests, CI automatically generates a Storybook deployment link that reviewers, designers, and QA can use to inspect changes interactively.
+
+For Storybook to work, components must accept their data through props or React contexts rather than reading directly from live mojom bindings. This forces a clean separation between the UI and its data source — the same mocking layer used for Storybook doubles as the mocking layer for Jest tests.
+
+```tsx
+// MyFeature.stories.tsx
+import type { Meta, StoryObj } from '@storybook/react'
+import { MyFeatureProvider } from '../state/my_feature_context'
+import { createMockService } from '../api/mock_service'
+import MyFeature from './MyFeature'
+
+const meta: Meta = {
+  title: 'MyFeature',
+  component: MyFeature,
+}
+export default meta
+
+export const Default: StoryObj = {
+  render: () => {
+    const mockService = createMockService()
+    return (
+      <MyFeatureProvider api={mockService}>
+        <MyFeature />
+      </MyFeatureProvider>
+    )
+  },
+}
+```
+
+## State Management
+
+Brave WebUI state is split into two categories: **remote state** (data originating from C++ via mojom) and **local UI state** (transient UI concerns like whether a menu is open).
+
+### Remote State with `createInterfaceApi`
+
+For remote state, use `createInterfaceApi` to wrap mojom interfaces. This utility generates React hooks that are backed by [TanStack Query](https://tanstack.com/query/latest/), giving you loading states, caching, and easy mocking.
+
+<Steps>
+  <Step title="Define the API">
+    Create an API factory that wraps your mojom remote:
+
+    ```ts
+    // state/my_api.ts
+    import { createInterfaceApi, endpointsFor } from '$web-common/api'
+    import * as Mojom from '../gen/mojom'
+
+    export function createMyApi(remote: Mojom.MyInterface) {
+      return createInterfaceApi({
+        endpoints: {
+          ...endpointsFor(remote, {
+            getItems: {
+              response: (result) => result.items,
+              placeholderData: [] as Mojom.Item[],
+            },
+            updateItem: {
+              mutationResponse: (result) => result.updatedItem,
+            },
+          }),
+        },
+      })
+    }
+    ```
+  </Step>
+  <Step title="Wire up a React Context">
+    Use `generateReactContextForAPI` so you can pass the API to a component tree without prop-drilling:
+
+    ```tsx
+    // state/my_feature_context.tsx
+    import { generateReactContextForAPI } from '$web-common/api'
+    import { createMyApi } from './my_api'
+
+    export const { useAPI: useMyFeature, Provider: MyFeatureProvider } =
+      generateReactContextForAPI<ReturnType<typeof createMyApi>>()
+    ```
+  </Step>
+  <Step title="Consume hooks in components">
+    Components subscribe to the API with generated hooks. Only the subscribed data causes re-renders:
+
+    ```tsx
+    // components/ItemList.tsx
+    import { useMyFeature } from '../state/my_feature_context'
+
+    export function ItemList() {
+      const { api } = useMyFeature()
+      const { data: items, isLoading } = api.useGetItems()
+
+      if (isLoading) return <Spinner />
+      return (
+        <ul>
+          {items.map((item) => (
+            <li key={item.id}>{item.name}</li>
+          ))}
+        </ul>
+      )
+    }
+    ```
+  </Step>
+</Steps>
+
+### Available API Patterns
+
+<Accordion title="Query Endpoints (read data)">
+  Use for data that should be fetched as soon as a component mounts. The hook returns `{ data, isLoading, isPending }`.
+
+  ```ts
+  getItems: {
+    response: (result) => result.items,
+    // Pre-fetch before any component mounts
+    prefetchWithArgs: [],
+    // Shown while real data is loading
+    placeholderData: [] as Mojom.Item[],
+  }
+  ```
+
+  Then in a component: `const { data: items } = api.useGetItems()`
+</Accordion>
+
+<Accordion title="Mutation Endpoints (write data)">
+  Use for actions that change state on the C++ side. The hook returns a `mutate` function plus `isPending` and `variables` for optimistic UI.
+
+  ```ts
+  updateItem: {
+    mutationResponse: (result) => result.updatedItem,
+    onSuccess: (result) => {
+      // Update the items query cache optimistically
+      api.getItems.update((old) => old.map((i) =>
+        i.id === result.updatedItem.id ? result.updatedItem : i
+      ))
+    },
+  }
+  ```
+
+  Then in a component: `const { mutate: updateItem, isPending } = api.useUpdateItem()`
+</Accordion>
+
+<Accordion title="Observer Events">
+  Use for data pushed from C++ via observer callbacks. Wire up the mojom receiver in `eventsFor` and update query caches directly:
+
+  ```ts
+  events: {
+    ...eventsFor(MyObserver, {
+      onItemsChanged(items) {
+        api.getItems.update(items)
+      },
+    },
+    (observer) => {
+      remote.addObserver(
+        new Mojom.MyObserverReceiver(observer).$.bindNewPipeAndPassReceiver()
+      )
+    })
+  }
+  ```
+</Accordion>
+
+<Accordion title="State Endpoints (observer-only state)">
+  For state that has no `get` function and is only ever pushed by an observer:
+
+  ```ts
+  import { state } from '$web-common/api'
+
+  // In API definition:
+  isAuthenticated: state<boolean>(),
+
+  // Updated from an observer event:
+  onAuthChanged(isAuth) { api.isAuthenticated.update(isAuth) }
+
+  // In component:
+  const { data: isAuthenticated } = api.useIsAuthenticated()
+  ```
+</Accordion>
+
+### Local UI State
+
+For purely local concerns (hover states, open/closed menus, pending edits), keep state as close to the component as possible:
+
+- **`useState`** — simple, single-component state.
+- **Small React Context** — when a cluster of sibling components all need the same values. Avoid passing the entire API through; instead, expose only what each component group needs.
+- **External store** (e.g., Zustand) — only when completely unrelated parts of the UI tree need the same state and Context re-renders would be too costly.
+
+<Warning>
+Avoid prop-drilling state more than two levels deep. If you find yourself passing a value through three or more component layers, reach for a small Context or a `createInterfaceApi` state endpoint instead.
+</Warning>
+
+## Mocking for Tests and Storybook
+
+The same mock factory pattern works for both Jest tests and Storybook stories. Use `makeCloseable` from `$web-common/api` to satisfy the `$: { close() }` shape that mojom remotes require:
+
+```typescript
+// api/mock_service.ts
+import { makeCloseable, Closable } from '$web-common/api'
+import * as Mojom from '../gen/mojom'
+
+export function createMockService(
+  overrides: Partial<Mojom.MyInterface> = {}
+): Closable<Mojom.MyInterface> {
+  return makeCloseable({
+    getItems: () => Promise.resolve({ items: [] }),
+    updateItem: () => Promise.resolve({ updatedItem: null }),
+    ...overrides,
+  })
+}
+```
+
+For Storybook stories that use Storybook controls (args), use a ref pattern so mocks always read the latest args value:
+
+```typescript
+function useStoryApi(args: StoryArgs) {
+  const argsRef = React.useRef(args)
+  argsRef.current = args
+
+  const [myApi] = React.useState(() =>
+    createMyApi(
+      createMockService({
+        getItems: () => Promise.resolve({
+          items: argsRef.current.showItems ? SAMPLE_ITEMS : [],
+        }),
+      })
+    )
+  )
+
+  // Invalidate all queries when storybook controls change so mocks re-run
+  React.useEffect(() => {
+    myApi.invalidateAll()
+  }, [myApi, args.showItems])
+
+  return myApi
+}
+```
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="WebUI Testing" icon="vial" href="./webui-testing">
+    Writing Jest unit tests and running them with pnpm
+  </Card>
+  <Card title="WebUI Strings" icon="language" href="./webui-strings">
+    Adding and managing localized strings in .grdp files
+  </Card>
+  <Card title="WebUI Overrides" icon="code" href="./webui-overriding">
+    Overriding Chromium's Lit/Polymer WebUI components
+  </Card>
+</CardGroup>

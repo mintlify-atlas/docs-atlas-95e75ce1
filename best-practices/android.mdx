@@ -1,0 +1,536 @@
+---
+title: "Android Development Best Practices for Brave Core"
+sidebarTitle: "Android"
+description: "Patterns and rules for Brave Core Android development: lifecycle safety, NullAway annotations, bytecode patching, theming, and build organization."
+---
+
+Brave Core's Android layer sits on top of Chromium's Java/Kotlin stack and inherits its build tooling, bytecode rewriting system, and NullAway null-safety enforcement. The guidelines below distill the most common review findings across async lifecycle handling, null safety, singleton patterns, UI theming, build organization, and patch strategy. Following them consistently reduces churn during Chromium upgrades and prevents hard-to-reproduce runtime crashes.
+
+## Lifecycle & Async Safety
+
+Android Activities and Fragments can be destroyed between when a callback is scheduled and when it executes. Every async path — service callbacks, `PostTask.postTask()`, Mojo responses, and animation listeners — must guard against this.
+
+<Accordion title="AND-001 — Check isActivityFinishingOrDestroyed() before UI operations">
+
+Always check `isActivityFinishingOrDestroyed()` before performing UI operations (showing dialogs, starting activities, manipulating views) in async callbacks.
+
+```java
+// ❌ WRONG - no lifecycle check in async callback
+private void maybeRequestDefaultBrowser() {
+    showDefaultBrowserDialog();
+}
+
+// ✅ CORRECT - guard against destroyed activity
+private void maybeRequestDefaultBrowser() {
+    if (isActivityFinishingOrDestroyed()) return;
+    showDefaultBrowserDialog();
+}
+
+// ✅ CORRECT - guard in animation callbacks
+animator.addListener(new AnimatorListenerAdapter() {
+    @Override
+    public void onAnimationEnd(Animator animation) {
+        if (isActivityFinishingOrDestroyed()) return;
+        mSplashContainer.setVisibility(View.GONE);
+        showPager();
+    }
+});
+```
+
+</Accordion>
+
+<Accordion title="AND-002 — Check fragment attachment before async UI updates">
+
+When async callbacks update UI through a Fragment, verify the fragment is still added and its host Activity is available.
+
+```java
+// ❌ WRONG - no fragment state checks
+void onServiceResult(Result result) {
+    updateUI(result);
+}
+
+// ✅ CORRECT - verify fragment is still attached
+void onServiceResult(Result result) {
+    if (!isAdded() || isDetached()) return;
+    Activity activity = getActivity();
+    if (activity == null || activity.isFinishing()) return;
+    updateUI(result);
+}
+```
+
+</Accordion>
+
+<Accordion title="AND-003 — Disable interactive UI during async operations">
+
+Disable buttons, preferences, and other interactive elements while an async operation is in progress to prevent double-clicks.
+
+```java
+// ❌ WRONG - allows double-clicks during async operation
+preference.setOnPreferenceClickListener(pref -> {
+    accountService.resendConfirmationEmail(callback);
+    return true;
+});
+
+// ✅ CORRECT - disable during async
+preference.setOnPreferenceClickListener(pref -> {
+    preference.setEnabled(false);
+    accountService.resendConfirmationEmail(result -> {
+        preference.setEnabled(true);
+        // handle result
+    });
+    return true;
+});
+```
+
+</Accordion>
+
+<Accordion title="AND-005 — Null-check services unavailable in incognito">
+
+Services accessed through bridges or native code may be `null` in incognito profiles. Always add explicit null checks at the point of use.
+
+```cpp
+// ❌ WRONG - assumes service is always available
+void NTPBackgroundImagesBridge::GetCurrentWallpaperForDisplay() {
+  view_counter_service_->GetCurrentWallpaperForDisplay();
+}
+
+// ✅ CORRECT - explicit null check
+void NTPBackgroundImagesBridge::GetCurrentWallpaperForDisplay() {
+  if (!view_counter_service_)
+    return;
+  view_counter_service_->GetCurrentWallpaperForDisplay();
+}
+```
+
+</Accordion>
+
+## Null Safety (NullAway)
+
+Chromium uses [NullAway](https://github.com/uber/NullAway) with JSpecify-style `@Nullable` annotations. NullAway runs as an Error Prone plugin for targets without `chromium_code = false`, and null checking is enabled for classes annotated with `@NullMarked`.
+
+<Note>
+  Key configuration facts: JSpecify mode is enabled — `@Nullable` is `TYPE_USE`. Non-annotated types default to non-null (no `@NonNull` needed). Nullness of local variables is inferred automatically. Annotations live under `org.chromium.build.annotations`.
+</Note>
+
+<Accordion title="AND-039 — Place @Nullable immediately before the type">
+
+`@Nullable` is `TYPE_USE` — it must appear immediately before the type it annotates.
+
+```java
+// ❌ WRONG - annotation on separate line
+@Nullable
+private String mValue;
+
+// ✅ CORRECT - immediately before the type
+private @Nullable String mValue;
+private Outer.@Nullable Inner mNestedType;
+
+// Position matters for arrays and generics:
+private String @Nullable[] mNullableArrayOfNonNullString;
+private @Nullable String[] mNonNullArrayOfNullableString;
+private List<@Nullable String> mNonNullListOfNullableString;
+private @Nullable Callback<@Nullable String> mNullableCallbackOfNullableString;
+```
+
+</Accordion>
+
+<Accordion title="AND-041 — Use @MonotonicNonNull for late-initialized fields">
+
+When a field starts as `null` but must never be set back to `null` after initialization, use `@MonotonicNonNull`.
+
+```java
+private @MonotonicNonNull String mSomeValue;
+
+public void doThing(String value) {
+    // Emits a warning — mSomeValue is still nullable here:
+    helper(mSomeValue);
+
+    mSomeValue = value;
+    // No warning — even in a lambda, NullAway trusts it stays non-null:
+    PostTask.postTask(TaskTraits.USER_BLOCKING, () -> helper(mSomeValue));
+}
+```
+
+</Accordion>
+
+<Accordion title="AND-042 — Choose the right assert/assume pattern">
+
+Use `assumeNonNull` vs `assertNonNull` vs `Objects.requireNonNull` depending on the safety level needed.
+
+```java
+import static org.chromium.build.NullUtil.assumeNonNull;
+import static org.chromium.build.NullUtil.assertNonNull;
+
+public String example() {
+    // Prefer statements for preconditions
+    assumeNonNull(mNullableThing);
+    assert mOtherThing != null;
+
+    // Use expression form when it improves readability
+    someHelper(assumeNonNull(Foo.maybeCreate(true)));
+
+    // Use assertNonNull when you need an assert as an expression
+    mNonNullField = assertNonNull(dict.get("key"));
+
+    String ret = obj.getNullableString();
+    if (willJustCrashLaterAnyways) {
+        assert ret != null;
+    } else {
+        Objects.requireNonNull(ret);
+    }
+    return ret;
+}
+```
+
+| Mechanism | Form | Crashes in prod? | Use when |
+|---|---|---|---|
+| `assumeNonNull()` | Statement or expression | No | You're confident the value is non-null |
+| `assertNonNull()` | Expression | No (Canary only) | You need a non-null expression |
+| `assert x != null` | Statement | No (Canary only) | You're not dereferencing locally |
+| `Objects.requireNonNull()` | Expression | Yes | Null would cause worse problems later |
+
+</Accordion>
+
+<Accordion title="AND-043 — Handle object destruction correctly">
+
+For classes with `destroy()` methods that null out otherwise non-null fields, choose one of two strategies:
+
+**Strategy 1 — `@Nullable` fields with `@EnsuresNonNullIf` guards (preferred for complex cases):**
+
+```java
+private @Nullable SomeService mService;
+
+@EnsuresNonNullIf(value = {"mService"}, result = false)
+private boolean isDestroyed() {
+    return mService == null;
+}
+
+public void doWork() {
+    if (isDestroyed()) return;
+    mService.execute();  // No warning
+}
+
+public void destroy() {
+    mService = null;
+}
+```
+
+**Strategy 2 — Suppress warnings on `destroy()` (simpler cases):**
+
+```java
+private SomeService mService;  // stays non-null
+
+@SuppressWarnings("NullAway")
+public void destroy() {
+    mService = null;
+}
+```
+
+</Accordion>
+
+<Accordion title="AND-048 — Use @Initializer for two-phase initialization">
+
+When a class uses two-phase initialization (e.g., `onCreate()`, `initialize()`), annotate the second-phase method with `@Initializer`. Android's `onCreate()` is implicitly `@Initializer`.
+
+```java
+public class MyComponent {
+    private SomeService mService;
+
+    public MyComponent() {
+        // mService not set here
+    }
+
+    @Initializer
+    public void initialize(SomeService service) {
+        mService = service;
+    }
+}
+```
+
+</Accordion>
+
+<Accordion title="AND-050 — Don't use intermediate booleans for null checks">
+
+NullAway cannot track nullness through intermediate boolean variables. Always use the null check directly in the `if` condition.
+
+```java
+// ❌ WRONG - NullAway loses track of nullness
+boolean isNull = thing == null;
+if (!isNull) {
+    thing.doWork();  // NullAway still warns!
+}
+
+// ✅ CORRECT - direct null check
+if (thing != null) {
+    thing.doWork();  // No warning
+}
+```
+
+</Accordion>
+
+## Singleton & Build Patterns
+
+<Accordion title="AND-006 — Use LazyHolder pattern for singleton factories">
+
+Use the LazyHolder idiom for singleton service factories instead of explicit `synchronized` blocks.
+
+```java
+// ❌ WRONG - explicit lock-based singleton
+public class BraveAccountServiceFactory {
+    private static final Object sLock = new Object();
+    private static BraveAccountServiceFactory sInstance;
+
+    public static BraveAccountServiceFactory getInstance() {
+        synchronized (sLock) {
+            if (sInstance == null) {
+                sInstance = new BraveAccountServiceFactory();
+            }
+            return sInstance;
+        }
+    }
+}
+
+// ✅ CORRECT - LazyHolder pattern
+public class BraveAccountServiceFactory {
+    private static class LazyHolder {
+        static final BraveAccountServiceFactory INSTANCE =
+                new BraveAccountServiceFactory();
+    }
+
+    public static BraveAccountServiceFactory getInstance() {
+        return LazyHolder.INSTANCE;
+    }
+}
+```
+
+</Accordion>
+
+<Accordion title="AND-024 — Keep bytecode-redirected constructors free of class static state">
+
+When bytecode rewriting redirects an allocation to a subclass, that type's constructor must not read its own static state during initialization.
+
+```java
+// ❌ WRONG - a redirected constructor can run before sEntries is initialized
+class BraveClass extends UpstreamClass {
+    private static final List<Entry> sEntries = List.of(new Entry());
+
+    BraveClass() {
+        Registry.register(sEntries);
+    }
+}
+
+// ✅ CORRECT - registration runs after sEntries is initialized
+class BraveClass extends UpstreamClass {
+    private static final List<Entry> sEntries = List.of(new Entry());
+
+    static {
+        Registry.register(sEntries);
+    }
+
+    BraveClass() {}
+}
+```
+
+</Accordion>
+
+<Accordion title="AND-022 — Bytecode adapter changes require bytecode tests">
+
+When adding or modifying a bytecode class adapter in `build/android/bytecode/java/org/brave/bytecode/`, add a corresponding bytecode test in `android/javatests/org/chromium/chrome/browser/BytecodeTest.java`. Tests should verify both class existence (`testClassesExist`) and method existence with correct return types (`testMethodsExist`).
+
+</Accordion>
+
+<Accordion title="AND-023 — Separate runtime vs test Proguard keep rules">
+
+Proguard keep rules must go in the correct file:
+
+- `android/java/proguard.flags` — Only for classes/methods accessed via reflection **at runtime**
+- `android/java/apk_for_test.flags` — For rules needed **only during testing**
+
+Putting test-only keep rules in `proguard.flags` unnecessarily increases the production APK size.
+
+</Accordion>
+
+## UI & Theming
+
+<Accordion title="AND-007 — Resolve theme colors at bind time">
+
+When a custom Preference or view resolves colors from theme attributes, do so at `onBindViewHolder` time, not during construction.
+
+```java
+// ❌ WRONG - resolve color during construction
+public class MyPreference extends Preference {
+    private final int mTextColor;
+
+    public MyPreference(Context context) {
+        super(context);
+        mTextColor = resolveThemeColor(context, R.attr.textColor); // stale if theme changes
+    }
+}
+
+// ✅ CORRECT - resolve at bind time
+public class MyPreference extends Preference {
+    @Override
+    public void onBindViewHolder(PreferenceViewHolder holder) {
+        super.onBindViewHolder(holder);
+        int textColor = resolveThemeColor(getContext(), R.attr.textColor);
+        ((TextView) holder.findViewById(R.id.title)).setTextColor(textColor);
+    }
+}
+```
+
+</Accordion>
+
+<Accordion title="AND-008 — Use app:isPreferenceVisible=false for conditionally shown preferences">
+
+When a preference will be programmatically removed based on a feature flag, set `app:isPreferenceVisible="false"` in XML to avoid a visual flash.
+
+```xml
+<!-- ✅ Prevents flash of preference before programmatic removal -->
+<org.chromium.chrome.browser.settings.BraveAccountPreference
+    android:key="brave_account"
+    app:isPreferenceVisible="false"
+    android:title="@string/brave_account_title" />
+```
+
+</Accordion>
+
+<Accordion title="AND-034 — Use baseline colors over Java code patches for theming">
+
+When fixing Android color/theming issues, prefer following upstream's approach of using baseline colors (XML color resources) for non-dynamic color states rather than patching Java code. Always verify fixes work with the Dynamic Colors flag both enabled and disabled.
+
+</Accordion>
+
+<Accordion title="AND-055 — Prefer Material Components over custom reimplementations">
+
+When a Material component exists for the UI element, use it instead of building a custom version. Material components carry built-in motion, accessibility, and theming. Brave subclasses are fine — `BraveSettingsSwitch extends MaterialSwitch` is the correct pattern.
+
+Common cases: `MaterialSwitch` over custom toggles, `MaterialButton` over styled `Button`, `BottomSheetDialogFragment` over hand-rolled sheets, `MaterialAlertDialogBuilder` over custom modal views.
+
+</Accordion>
+
+## Resource & String Conventions
+
+<Accordion title="AND-027 — Brave resources go in brave-res, not upstream folders">
+
+Brave-specific Android resources (drawables, layouts, etc.) should be placed in a dedicated `brave-res` folder, not copied into upstream Chromium resource directories. The upstream resource directories should only be used when intentionally overriding an existing upstream resource.
+
+</Accordion>
+
+<Accordion title="AND-035 — Don't modify upstream string resource files">
+
+Never modify upstream Chromium string resource files (e.g., `chrome_strings.grd`, upstream `strings.xml`). Add Brave-specific strings to `android_brave_strings.grd` or the appropriate Brave-owned resource file instead.
+
+</Accordion>
+
+<Accordion title="AND-036 — Match upstream nullability annotations in overridden methods">
+
+When overriding upstream methods in Brave Java code, match the upstream nullability annotations.
+
+```java
+// ❌ WRONG - upstream method has @NullUnmarked but override doesn't
+@Override
+public void onResult(Profile profile) { ... }
+
+// ✅ CORRECT - match upstream annotations
+@NullUnmarked
+@Override
+public void onResult(Profile profile) { ... }
+```
+
+</Accordion>
+
+## Build Organization
+
+<Accordion title="AND-056 — Place new Java files in feature-local Android directories">
+
+Default: put new feature-specific Java files in the feature's Android directory, not the legacy Android Java tree. Use `browser/<feature>/android/` rather than `android/java/org/chromium/chrome/browser/...`.
+
+```gn
+# ❌ WRONG - append standalone feature code to the legacy source list
+brave_java_sources += [
+  "../../brave/android/java/org/chromium/chrome/browser/my_feature/MyFeatureController.java",
+]
+
+# ✅ CORRECT - give the feature its own Android module
+# browser/my_feature/android/BUILD.gn
+import("//build/config/android/rules.gni")
+
+android_library("java") {
+  sources = [ "java/src/org/chromium/chrome/browser/my_feature/MyFeatureController.java" ]
+  deps = [ "//base:base_java" ]
+}
+```
+
+Integrate the module as a dependency via `build/android/config.gni`:
+
+```gn
+# ✅ CORRECT
+brave_chrome_java_deps += [ "//brave/browser/my_feature/android:java" ]
+```
+
+**Exception:** New files that subclass upstream classes in deprecated locations are allowed in the corresponding deprecated Brave location.
+
+</Accordion>
+
+<Accordion title="AND-019 — Group feature-specific Java sources into separate build targets">
+
+When Java sources for a specific feature (e.g., `crypto_wallet`) accumulate in `brave_java_sources.gni`, consider creating a separate build target. This improves build isolation and dependency tracking.
+
+</Accordion>
+
+## Code Style
+
+<Accordion title="AND-021 — Prefer early returns over deep nesting">
+
+When a condition check determines whether the rest of a method should execute, return early rather than wrapping logic in nested `if` blocks.
+
+```java
+// ❌ WRONG - deep nesting
+private void handleState() {
+    if (!isFinished) {
+        if (hasData) {
+            // ... lots of code ...
+        }
+    }
+}
+
+// ✅ CORRECT - early return
+private void handleState() {
+    if (isFinished) return;
+    if (!hasData) return;
+    // ... lots of code at top level ...
+}
+```
+
+</Accordion>
+
+<Accordion title="AND-037 — Don't repeat class name in Log TAG">
+
+Android Log TAG fields should use a short, descriptive string — not repeat the full class name.
+
+```java
+// ❌ WRONG - redundant
+private static final String TAG = "BraveVpnProfileController";
+
+// ✅ CORRECT - short and clear
+private static final String TAG = "BraveVPN";
+```
+
+</Accordion>
+
+<Accordion title="AND-038 — Use layout shorthand attributes">
+
+Use shorthand XML layout attributes (`paddingHorizontal`, `marginHorizontal`, etc.) instead of setting start/end or top/bottom separately.
+
+```xml
+<!-- ❌ WRONG - verbose -->
+<View
+    android:paddingStart="16dp"
+    android:paddingEnd="16dp" />
+
+<!-- ✅ CORRECT - shorthand -->
+<View
+    android:paddingHorizontal="16dp" />
+```
+
+</Accordion>

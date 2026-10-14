@@ -1,0 +1,147 @@
+---
+title: "How to Contribute to Brave Core"
+sidebarTitle: "Guidelines"
+description: "Brave Core welcomes contributions of all kinds — from issue triage and documentation updates to translations and C++ code changes — no code required to make an impact."
+---
+
+Brave Core is an open-source project built on Chromium, and contributions from the community are essential to improving the browser for everyone. Whether you're fixing a typo in the README, reproducing a bug, translating the UI into a new language, or writing a new feature in C++, every contribution matters. This guide explains the different ways you can help, what you'll need to get started, and the workflow for making and submitting changes.
+
+## Ways to Contribute
+
+<CardGroup cols={2}>
+  <Card title="Triage Issues" icon="tag">
+    Help the team manage the [issue tracker](https://github.com/brave/brave-browser/issues) by reproducing bugs, identifying duplicates, clarifying reproduction steps, and ensuring fixed issues have the right milestones set.
+  </Card>
+  <Card title="Update Documentation" icon="book-open">
+    Improve the README files for `brave-browser` and `brave-core`, update the [project wiki](https://github.com/brave/brave-browser/wiki), or propose ways to bring documentation to other languages.
+  </Card>
+  <Card title="Translations & Localization" icon="globe">
+    All UI strings are written first in English and then localized by real people. If a translation is missing or incorrect, [email the localization team](mailto:localization@brave.com) or volunteer as a translator through [Transifex](https://explore.transifex.com/brave/brave_en/).
+  </Card>
+  <Card title="Write Code" icon="code">
+    Pick up a [good first issue](https://github.com/brave/brave-browser/labels/good%20first%20issue), fix a bug, or implement a feature. Changes may involve JavaScript/TypeScript in WebUI components or C++ changes in Brave or Chromium internals.
+  </Card>
+</CardGroup>
+
+## Getting Started Checklist
+
+Before making your first code contribution, work through the following steps to set up your environment correctly.
+
+<Steps>
+  <Step title="Create a GitHub account">
+    Make sure you have a [GitHub account](https://github.com/join) and are signed in.
+  </Step>
+  <Step title="Open or find an issue">
+    Submit a [ticket](https://github.com/brave/brave-browser/issues) if one doesn't exist yet. Include the Brave version, operating system, and steps to reproduce the problem.
+  </Step>
+  <Step title="Install editor tooling">
+    For JavaScript/TypeScript changes, install a [Standard](http://standardjs.com/) plugin for your editor. For C++ changes, set up [clang-format](https://chromium.googlesource.com/chromium/src/+/master/docs/sublime_ide.md#Format-Selection-with-Clang_Format-Chromium-only) to keep code style consistent.
+  </Step>
+  <Step title="Clone the repository">
+    `brave-core` must be checked out into `src/brave` inside an existing project folder. See the [brave-browser wiki](https://github.com/brave/brave-browser/wiki) for platform-specific setup instructions.
+
+    ```bash
+    git clone git@github.com:brave/brave-core.git path-to-your-project/src/brave
+    cd path-to-your-project/src/brave
+    pnpm run init
+    ```
+  </Step>
+  <Step title="Add your fork as a remote">
+    By default, `origin` points to upstream. Add your personal fork as a named remote so you can push branches to it.
+
+    ```bash
+    cd src/brave
+    git remote add myfork git@github.com:YOUR_USERNAME/brave-core.git
+    git fetch myfork
+    ```
+  </Step>
+</Steps>
+
+## Fork and Branch Workflow
+
+Once your environment is set up, the standard contribution workflow follows the fork-and-branch model used across most open-source Chromium-based projects.
+
+<Steps>
+  <Step title="Create a descriptive branch">
+    Use a name that reflects the work — for example, `fix-fullscreen-issue` or `add-rewards-unit-test`.
+
+    ```bash
+    cd src/brave
+    git checkout -b fix-fullscreen-issue
+    ```
+  </Step>
+  <Step title="Make focused commits">
+    Commit in logical units and write a descriptive commit message body. Reference the issue you're fixing using GitHub's auto-closing keywords.
+
+    ```
+    Add contributing guide
+
+    This is a first pass at a contributor's guide so now people will know
+    how to get pull requests accepted faster.
+
+    Fix https://github.com/brave/brave-browser/issues/108
+    ```
+
+    If needed, squash commits before opening a PR with `git rebase -i`.
+  </Step>
+  <Step title="Write or update tests">
+    New features and most bug fixes require a new test before the PR will be accepted. Run the full test suite locally before submitting.
+
+    ```bash
+    # C++ unit and browser tests
+    pnpm run test brave_unit_tests
+    pnpm run test brave_browser_tests
+
+    # JavaScript unit tests (from src/brave)
+    pnpm run test-unit
+    ```
+  </Step>
+  <Step title="Keep your fork in sync">
+    Regularly rebase your work against the upstream `master` branch to reduce merge conflicts during review.
+
+    ```bash
+    git fetch origin
+    git fetch myfork
+    git checkout -b fork_master myfork/master
+    git rebase origin/master
+    git push myfork fork_master:master
+    ```
+  </Step>
+  <Step title="Open a pull request">
+    Push your branch to your fork and open a PR against `brave/brave-core`. See the [Pull Requests guide](/contributing/pull-requests) for exactly what each PR must include.
+  </Step>
+</Steps>
+
+## AI-Assisted Contribution Policy
+
+Brave permits the use of AI coding tools (such as GitHub Copilot, Claude, and ChatGPT) to assist with contributions. However, the human contributor is **fully responsible** for every PR they submit, regardless of how it was produced.
+
+<Warning>
+  Do not submit AI-generated changes you haven't built, tested, and understood yourself. AI tools make it easy to generate many patches quickly, but the review burden falls entirely on Brave's maintainers — submitting low-quality or untested AI-generated PRs will result in them being closed without review.
+</Warning>
+
+The specific requirements for AI-assisted contributions are:
+
+- **You must understand** the changes you are proposing — do not simply relay AI output without comprehension.
+- **You must manually build and test** every change on the relevant platform(s) before submitting, exactly as you would for any other contribution.
+- **Do not add AI-generated bot reviewers** (e.g., Copilot reviewer) to your PRs — code reviews are conducted by Brave maintainers.
+- **Be transparent** about significant AI involvement when it played a major role in identifying the issue or generating the fix.
+
+Using AI tools does not change the quality bar, the testing requirements, or the expected PR volume for contributors.
+
+## Helpful Resources
+
+<CardGroup cols={2}>
+  <Card title="Triage Guidelines" icon="list-check" href="https://github.com/brave/brave-browser/wiki/Triage-Guidelines">
+    Detailed guidance on labelling, reproducing, and managing issues in the Brave issue tracker.
+  </Card>
+  <Card title="Patching Chromium" icon="puzzle-piece" href="https://github.com/brave/brave-core/blob/master/docs/patching_and_chromium_src.md">
+    Instructions for working with the patch system used to override upstream Chromium code.
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="https://github.com/brave/brave-browser/wiki/Troubleshooting">
+    Solutions to the most common build and environment issues encountered by new contributors.
+  </Card>
+  <Card title="Good First Issues" icon="star" href="https://github.com/brave/brave-browser/labels/good%20first%20issue">
+    Curated list of issues appropriate for contributors new to the Brave codebase.
+  </Card>
+</CardGroup>

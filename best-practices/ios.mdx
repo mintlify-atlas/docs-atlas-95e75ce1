@@ -1,0 +1,573 @@
+---
+title: "iOS Development Best Practices for Brave Core"
+sidebarTitle: "iOS"
+description: "Swift, Objective-C, and SwiftUI patterns for Brave Core on iOS: concurrency safety, dependency injection, Nala design system, and build conventions."
+---
+
+Brave Core's iOS layer is written in Swift and Objective-C++ on top of Chromium's C++ core, with SwiftUI increasingly used for new UI surfaces. The guidelines below address the most common review patterns across memory management, Swift concurrency, SwiftUI idioms, Objective-C interop, architecture (Tab Helpers, dependency injection, no singletons), and build organization. Following them prevents retain cycles, layout loops, and silent feature failures.
+
+## Swift Concurrency & Memory Management
+
+<Accordion title="IOS-001 — Use [weak self] in async closures to prevent retain cycles">
+
+Always capture `[weak self]` in closures that outlive the current scope — network callbacks, notification handlers, animation completions, and stored closures. Use `[unowned self]` only when the closure's lifetime is guaranteed to be shorter than `self`.
+
+**Exception:** Fire-and-forget `Task {}` blocks that are **not** stored as a property do not need `[weak self]`.
+
+```swift
+// ❌ WRONG - strong self capture in stored closure
+dataSource.onUpdate = {
+  self.reloadData()  // Retain cycle!
+}
+
+// ✅ CORRECT - weak self in stored closure
+dataSource.onUpdate = { [weak self] in
+  self?.reloadData()
+}
+
+// ✅ CORRECT - fire-and-forget Task (no retain cycle)
+Task {
+  await self.fetchData()
+}
+
+// ❌ WRONG - Task stored as property without weak self
+fetchTask = Task {
+  await self.fetchData()  // Retain cycle!
+}
+
+// ✅ CORRECT - weak self when Task is stored
+fetchTask = Task { [weak self] in
+  await self?.fetchData()
+}
+```
+
+Apply `[weak self]` to the **root/outermost closure** only — inner closures inherit the capture from the outer scope.
+
+</Accordion>
+
+<Accordion title="IOS-002 — Use @Observable macro, not ObservableObject">
+
+Prefer the `@Observable` macro (Observation framework) over `ObservableObject` (Combine). `@Observable` requires less boilerplate and integrates better with SwiftUI.
+
+```swift
+// ❌ WRONG - legacy Combine pattern
+class ViewModel: ObservableObject {
+  @Published var items: [Item] = []
+}
+
+// ✅ CORRECT - modern Observation framework
+@Observable
+class ViewModel {
+  var items: [Item] = []
+}
+```
+
+</Accordion>
+
+<Accordion title="IOS-003 — Use @MainActor to ensure UI work runs on the main thread">
+
+Mark methods and types that perform UI work as `@MainActor`. Tasks inherit actor isolation from their enclosing context — adding `@MainActor` to a Task inside an already-`@MainActor`-isolated context is redundant.
+
+```swift
+// ❌ WRONG - redundant @MainActor on Task inside @MainActor context
+@MainActor
+class MyViewController: UIViewController {
+  func refresh() {
+    Task { @MainActor in  // Redundant
+      tableView.reloadData()
+    }
+  }
+}
+
+// ✅ CORRECT - Task inherits @MainActor from enclosing class
+@MainActor
+class MyViewController: UIViewController {
+  func refresh() {
+    Task {
+      let data = await fetchData()
+      tableView.reloadData()  // Already on MainActor
+    }
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="IOS-012 — Use withTaskCancellationHandler when bridging callbacks to async">
+
+When wrapping callback-based APIs with `withCheckedContinuation`, use `withTaskCancellationHandler` to propagate cancellation properly.
+
+```swift
+// ✅ CORRECT - cancellation-aware bridging
+func fetchData() async throws -> Data {
+  try await withTaskCancellationHandler {
+    try await withCheckedThrowingContinuation { continuation in
+      request.start { result in
+        continuation.resume(with: result)
+      }
+    }
+  } onCancel: {
+    request.cancel()
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="IOS-013 — Always call completion handlers on all code paths">
+
+When a function accepts a completion handler, always call it on every code path — including error and early-return paths.
+
+```swift
+// ❌ WRONG - completion handler not called on error path
+func fetchData(from url: URL, _ completionHandler: @escaping () -> Void) {
+  if url.scheme != "https" { return }  // Didn't call completionHandler!
+  // ...
+}
+
+// ✅ CORRECT - completion handler called in all paths
+func fetchData(from url: URL, _ completionHandler: @escaping () -> Void) {
+  if url.scheme != "https" {
+    completionHandler()
+    return
+  }
+  // ...
+}
+```
+
+</Accordion>
+
+## Swift Idioms & Language Best Practices
+
+<Accordion title="IOS-004 — Use #available compiler checks">
+
+Use `#available` for API availability checks, not manual version comparisons.
+
+```swift
+// ❌ WRONG - manual version check
+if ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 17 {
+  useNewAPI()
+}
+
+// ✅ CORRECT - compiler-enforced availability
+if #available(iOS 17, *) {
+  useNewAPI()
+}
+```
+
+</Accordion>
+
+<Accordion title="IOS-005 — Prefer Swift idioms for concise code">
+
+Use Swift-native patterns instead of verbose alternatives:
+
+```swift
+// Expression-level switch
+let title = switch state {
+  case .loading: "Loading..."
+  case .loaded: "Done"
+  case .error: "Failed"
+}
+
+// for-where instead of guard/continue
+// ❌ WRONG
+for item in items {
+  guard item.isEnabled else { continue }
+  process(item)
+}
+// ✅ CORRECT
+for item in items where item.isEnabled {
+  process(item)
+}
+
+// max(by:) instead of sorted().first
+// ❌ WRONG
+let newest = items.sorted(by: { $0.date > $1.date }).first
+// ✅ CORRECT
+let newest = items.max(by: { $0.date < $1.date })
+
+// Combine guard conditions
+// ❌ WRONG
+guard let a = optionalA else { return }
+guard let b = optionalB else { return }
+// ✅ CORRECT
+guard let a = optionalA, let b = optionalB else { return }
+```
+
+</Accordion>
+
+<Accordion title="IOS-010 — Use let over var for single-assignment properties">
+
+Use `let` for properties that are assigned once and never mutated.
+
+**Exception:** Swift structs control mutability at the usage site via `let`/`var`, so `var` properties in structs are acceptable.
+
+```swift
+struct Item {
+  var name: String  // OK — mutability controlled by usage
+}
+
+let itemOne = Item(name: "...") // itemOne.name is immutable
+var itemTwo = Item(name: "...") // itemTwo.name is mutable
+```
+
+</Accordion>
+
+<Accordion title="IOS-011 — Avoid implicitly unwrapped optionals for viewDidLoad properties">
+
+Do not use implicitly unwrapped optionals (`!`) for properties initialized in `viewDidLoad`. Use lazy properties, optional types with safe unwrapping, or initialize in the initializer.
+
+```swift
+// ❌ WRONG - crash risk if accessed before viewDidLoad
+var tableView: UITableView!
+
+// ✅ CORRECT - lazy initialization
+lazy var tableView = UITableView()
+```
+
+</Accordion>
+
+<Accordion title="IOS-066 — Artificial delays require comments">
+
+Any use of `Task.sleep` or similar artificial delays must include a comment explaining why the delay is necessary.
+
+```swift
+// ❌ WRONG - unexplained delay
+try await Task.sleep(nanoseconds: 500_000_000)
+
+// ✅ CORRECT - documented reason
+// Wait for WebKit to finish layout after orientation change.
+// WebKit does not provide a completion callback for this operation.
+try await Task.sleep(nanoseconds: 500_000_000)
+```
+
+</Accordion>
+
+## SwiftUI Guidelines
+
+<Accordion title="IOS-018 — Use .clipShape instead of deprecated .cornerRadius()">
+
+```swift
+// ❌ WRONG - deprecated modifier
+Text("Hello")
+  .cornerRadius(8)
+
+// ✅ CORRECT - modern API
+Text("Hello")
+  .clipShape(.rect(cornerRadius: 8))
+```
+
+</Accordion>
+
+<Accordion title="IOS-019 — Use .background(_:in:) with shape parameter">
+
+```swift
+// ❌ WRONG - separate background and clip
+Text("Hello")
+  .background(Color.blue)
+  .clipShape(RoundedRectangle(cornerRadius: 8))
+
+// ✅ CORRECT - combined
+Text("Hello")
+  .background(.blue, in: .rect(cornerRadius: 8))
+```
+
+</Accordion>
+
+<Accordion title="IOS-020 — Use stack spacing instead of individual padding">
+
+```swift
+// ❌ WRONG - padding on each child
+VStack {
+  Text("Title")
+    .padding(.bottom, 8)
+  Text("Subtitle")
+    .padding(.bottom, 8)
+  Text("Body")
+}
+
+// ✅ CORRECT - stack spacing
+VStack(spacing: 8) {
+  Text("Title")
+  Text("Subtitle")
+  Text("Body")
+}
+```
+
+</Accordion>
+
+<Accordion title="IOS-078 — Use Label for icon-only buttons in SwiftUI">
+
+Always use `Label` with `.labelStyle(.iconOnly)` for icon-only buttons to ensure accessibility information is provided.
+
+```swift
+// ❌ WRONG - no accessibility label
+Button {
+  // ...
+} label: {
+  Image(braveSystemName: "leo.trash")
+}
+
+// ✅ CORRECT - accessible icon-only button
+Button {
+  // ...
+} label: {
+  Label("Delete", braveSystemImage: "leo.trash")
+    .labelStyle(.iconOnly)
+}
+```
+
+</Accordion>
+
+<Accordion title="IOS-080 — Size Nala icons using fonts, not frame">
+
+Nala icons are custom SF Symbols and should be sized with `.font()`, not `.resizable().frame()`.
+
+```swift
+// ❌ WRONG - treating icon like an image
+Image(braveSystemName: "leo.trash")
+  .resizable()
+  .frame(width: 24, height: 24)
+
+// ✅ CORRECT - sizing with font
+Image(braveSystemName: "leo.trash")
+  .font(.title3)
+```
+
+</Accordion>
+
+<Accordion title="IOS-081 — Do not use explicit font sizes">
+
+UI must adhere to the user's dynamic font sizing preferences. Use semantic font styles or `@ScaledMetric`.
+
+```swift
+// ❌ WRONG - fixed font size ignores user preferences
+Text("Hello World")
+  .font(.system(size: 15))
+
+// ✅ CORRECT - semantic font style
+Text("Hello World")
+  .font(.subheadline)
+
+// ✅ CORRECT - scaled custom value
+@ScaledMetric private var customSize = 15
+Text("Hello World")
+  .font(.system(size: customSize))
+```
+
+</Accordion>
+
+<Accordion title="IOS-082 — Do not initialize SwiftUI @State on init">
+
+Do not assign `@State` properties in `init` using `State(wrappedValue:)`. Pass in the initial value and assign it using an `onAppear` or `task` modifier.
+
+```swift
+// ❌ WRONG - assigning @State in init
+struct ContentView: View {
+  @State private var value: Int
+  init(value: Int) {
+    self._value = State(wrappedValue: value)
+  }
+}
+
+// ✅ CORRECT - assign via onAppear
+struct ContentView: View {
+  var initialValue: Int
+  @State private var value: Int?
+
+  var body: some View {
+    Color.black
+      .onAppear {
+        value = initialValue
+      }
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="IOS-083 — Avoid manual/computed SwiftUI Bindings">
+
+Avoid using `Binding(get:set:)` for side-effects or transformations. This can cause unnecessary SwiftUI hierarchy rebuilds.
+
+```swift
+// ❌ WRONG - Using Binding(get:set) for side-effects
+struct ContentView: View {
+  @State private var isEnabled: Bool = false
+  var body: some View {
+    Toggle("Setting", isOn: Binding(
+      get: { isEnabled },
+      set: { newValue in
+        isEnabled = newValue
+        performSomeWork()
+      }
+    ))
+  }
+}
+
+// ✅ CORRECT - Use onChange
+struct ContentView: View {
+  @State private var isEnabled: Bool = false
+  var body: some View {
+    Toggle("Setting", isOn: $isEnabled)
+      .onChange(of: isEnabled) { _, newValue in
+        if newValue {
+          performSomeWork()
+        }
+      }
+  }
+}
+```
+
+</Accordion>
+
+## Objective-C Interop
+
+<Accordion title="IOS-030 — Wrap ObjC headers with nullability annotations">
+
+All Objective-C headers should use `NS_ASSUME_NONNULL_BEGIN`/`NS_ASSUME_NONNULL_END` and explicitly annotate nullable parameters.
+
+```objc
+// ✅ CORRECT
+NS_ASSUME_NONNULL_BEGIN
+
+@interface BraveManager : NSObject
+- (void)loadURL:(NSURL *)url completion:(nullable CompletionBlock)completion;
+@end
+
+NS_ASSUME_NONNULL_END
+```
+
+</Accordion>
+
+<Accordion title="IOS-034 — Use isEqualToString: for NSString comparison">
+
+Never use `==` or `!=` for `NSString` comparison — use `isEqualToString:`.
+
+```objc
+// ❌ WRONG - pointer comparison
+if (string == @"expected") { ... }
+
+// ✅ CORRECT - value comparison
+if ([string isEqualToString:@"expected"]) { ... }
+```
+
+</Accordion>
+
+<Accordion title="IOS-037 — Weak/strong dance in posted tasks">
+
+When posting tasks from Objective-C++ that capture `self`, pass `weakSelf` as a closure parameter rather than capturing it directly.
+
+```objc
+// ❌ WRONG - capturing weakSelf directly in block
+__weak typeof(self) weakSelf = self;
+dispatch_async(queue, ^{
+  [weakSelf doWork];  // weakSelf may be nil after check
+});
+
+// ✅ CORRECT - weak/strong dance
+__weak typeof(self) weakSelf = self;
+dispatch_async(queue, ^{
+  __strong typeof(weakSelf) strongSelf = weakSelf;
+  if (!strongSelf) return;
+  [strongSelf doWork];
+});
+```
+
+</Accordion>
+
+<Accordion title="IOS-071 — chromium_src iOS overrides: prefer subclassing">
+
+When overriding iOS Chromium classes via chromium_src, prefer subclassing over code duplication. Use the `#define`/`#include`/`#undef` pattern.
+
+```cpp
+// chromium_src/ios/chrome/browser/some_file.mm
+#define ChromeViewController BraveViewController
+
+#include <ios/chrome/browser/some_file.mm>
+
+#undef ChromeViewController
+```
+
+Always add blank lines around the `#define`/`#undef`-wrapped includes for readability.
+
+</Accordion>
+
+## Architecture
+
+<CardGroup cols={2}>
+  <Card title="No Singletons" icon="ban">
+    Do not use singletons for service access. Pass dependencies through initializers, method parameters, or the `Tab`/`TabHelper` extension pattern (IOS-039).
+  </Card>
+  <Card title="Tab Helpers & TabDataValues" icon="puzzle-piece">
+    Tab-associated data should use the `TabDataValues` extension pattern, not stored properties or associated objects. Do not add feature data to `TabState` directly (IOS-040, IOS-041).
+  </Card>
+  <Card title="View Model Independence" icon="eye-slash">
+    View models must not import or reference SDK singletons directly. Pass SDK dependencies through the initializer for testability (IOS-042).
+  </Card>
+  <Card title="Feature Flag Gating" icon="flag">
+    Feature flag checks should gate handler/observer **registration**, not runtime checks inside the handler. This avoids unnecessary overhead when the feature is disabled (IOS-044).
+  </Card>
+</CardGroup>
+
+<Accordion title="IOS-043 — Bind ProfileIOS directly, avoid getLastUsedProfile">
+
+Pass `ProfileIOS` explicitly into closures and initializers. Do not call `getLastUsedProfile` at point of use — the last-used profile can change.
+
+</Accordion>
+
+<Accordion title="IOS-049 — Use raw_ptr<T> for stored pointers in C++ classes">
+
+When a C++ class stores a pointer to another object, use `raw_ptr<T>` instead of raw `T*`. This enables Chromium's pointer safety checks.
+
+</Accordion>
+
+## Design System
+
+<Accordion title="IOS-027 — Use Brave design system colors">
+
+Use `UIColor(braveSystemName:)` for colors, not hard-coded values. Using system colors is acceptable in settings-like screens where matching default iOS styling is expected.
+
+```swift
+// ❌ WRONG - hard-coded color
+view.backgroundColor = UIColor(red: 0.2, green: 0.4, blue: 0.8, alpha: 1)
+
+// ✅ CORRECT - design system color
+view.backgroundColor = UIColor(braveSystemName: .primary20)
+```
+
+</Accordion>
+
+<Accordion title="IOS-079 — Use Nala design system icons over Apple's system icons">
+
+Use `Image(braveSystemName:)` with Nala (Leo) icons instead of Apple's `Image(systemName:)`.
+
+```swift
+// ❌ WRONG - Apple system icon
+Image(systemName: "trash")
+
+// ✅ CORRECT - Nala design system icon
+Image(braveSystemName: "leo.trash")
+```
+
+</Accordion>
+
+## Build & CI
+
+<Accordion title="IOS-075 — Include all iOS test targets in brave_all_unit_tests">
+
+Every new iOS test target must be included in `brave_all_unit_tests`. Tests that are not included will never run on CI.
+
+</Accordion>
+
+<Accordion title="IOS-076 — Feature flag names must match C++ feature names">
+
+In iOS bridge headers, feature flag names must exactly match the C++ `base::Feature` names. Mismatches cause silent failures where the flag appears to work but doesn't actually control the feature.
+
+</Accordion>
+
+<Accordion title="IOS-074 — Use GN build args for platform-specific feature defaults">
+
+Use GN build arguments (not C++ source code) to set platform-specific feature defaults. This allows build-time configuration and reduces `#ifdef` clutter.
+
+</Accordion>

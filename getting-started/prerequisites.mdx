@@ -1,0 +1,142 @@
+---
+title: "Prerequisites for Building Brave Core"
+sidebarTitle: "Prerequisites"
+description: "Platform-specific toolchain requirements for building Brave Core on Linux, macOS, Windows, Android, and iOS before cloning the repository."
+---
+
+Before you clone the Brave Core repository and initialize the build environment, your machine must satisfy a set of platform-specific prerequisites. These include system packages, SDKs, compiler toolchains, and the Node.js-based build tooling that Brave Core uses. Skipping this step — or using wrong versions — is the most common cause of mysterious build failures, so read your platform's guide in full before proceeding.
+
+## Supported Platforms
+
+Brave Core supports building the browser on and for the following targets:
+
+| Platform | Build host | Target |
+|---|---|---|
+| Linux | Linux (x86_64) | Linux desktop |
+| macOS | macOS (Apple Silicon / Intel) | macOS desktop |
+| Windows | Windows 10/11 (x86_64) | Windows desktop |
+| Android | Linux or macOS | Android (arm, arm64, x86, x64) |
+| iOS | macOS | iOS (arm64, simulator) |
+
+<Note>
+  All platform setup guides are maintained in the [brave-browser wiki](https://github.com/brave/brave-browser/wiki). The sections below summarise requirements and link to the authoritative guides.
+</Note>
+
+## Platform Setup Guides
+
+<Tabs>
+  <Tab title="Linux">
+    The Linux guide covers installing `build-essential`, `clang`, `python3`, `git`, `curl`, and other packages via your distribution's package manager. Brave builds on Debian/Ubuntu-based and RPM-based distributions.
+
+    **Key requirements:**
+    - A 64-bit Linux distribution with a reasonably recent kernel
+    - At least 16 GB RAM (32 GB recommended for parallel link jobs)
+    - At least 100 GB free disk space for a full Chromium + Brave checkout
+
+    📖 [Linux Development Environment](https://github.com/brave/brave-browser/wiki/Linux-Development-Environment)
+  </Tab>
+  <Tab title="macOS">
+    The macOS guide walks through installing Xcode and the Xcode Command Line Tools, which provide the system toolchain. Brave's build system downloads its own `clang` toolchain via `depot_tools`, so the Xcode version mainly needs to satisfy the SDK requirement.
+
+    **Key requirements:**
+    - macOS 13 Ventura or later (Apple Silicon or Intel)
+    - Xcode 15+ with the Command Line Tools installed (`xcode-select --install`)
+    - At least 16 GB RAM; 100 GB free disk space
+
+    📖 [macOS Development Environment](https://github.com/brave/brave-browser/wiki/macOS-Development-Environment)
+  </Tab>
+  <Tab title="Windows">
+    The Windows guide covers installing Visual Studio (with the required workloads), the Windows SDK, and configuring long path support. Brave builds on Windows require Developer Mode to be enabled to support symlinks.
+
+    **Key requirements:**
+    - Windows 10 version 1903 or later, or Windows 11 (64-bit)
+    - Visual Studio 2022 with the "Desktop development with C++" workload
+    - Windows 11 SDK (10.0.22621.0 or later)
+    - Developer Mode enabled in Windows Settings
+
+    📖 [Windows Development Environment](https://github.com/brave/brave-browser/wiki/Windows-Development-Environment)
+  </Tab>
+  <Tab title="Android">
+    Android builds run on a Linux or macOS host and produce APKs for the Android platform. You will need the Android SDK, NDK, and Java in addition to the standard desktop build prerequisites for your host OS.
+
+    **Key requirements:**
+    - A Linux or macOS host meeting the respective desktop prerequisites
+    - Android Studio or the standalone SDK tools (installed automatically by the init step)
+    - A target CPU architecture: `arm`, `arm64`, `x86`, or `x64`
+
+    📖 [Android Development Environment](https://github.com/brave/brave-browser/wiki/Android-Development-Environment)
+  </Tab>
+  <Tab title="iOS">
+    iOS builds require a macOS host with Xcode. The Brave iOS browser (`brave-ios`) lives inside the repository at `ios/brave-ios/` and is built via an Xcode project rather than the standard `pnpm run build` flow.
+
+    **Key requirements:**
+    - macOS host meeting the macOS desktop prerequisites
+    - Xcode 15 or later with iOS Simulator and iOS device SDK components installed
+    - An Apple Developer account for device deployment (optional for simulator builds)
+
+    📖 [iOS Development Environment](https://github.com/brave/brave-browser/wiki/iOS-Development-Environment)
+  </Tab>
+</Tabs>
+
+## Universal Requirements
+
+These tools are required on **all** platforms before running any Brave Core scripts.
+
+### Node.js
+
+Brave Core's build scripts are written in TypeScript and executed by Node.js. The version requirement is specified in `package.json` under `devEngines`:
+
+```json
+"devEngines": {
+  "runtime": {
+    "name": "node",
+    "version": ">=24.16.0 <25.0.0",
+    "onFail": "error"
+  }
+}
+```
+
+Install Node.js 24.x from [nodejs.org](https://nodejs.org/) or via a version manager such as `nvm` or `fnm`. Using an incorrect version will produce an error at `pnpm install` time.
+
+### pnpm
+
+Brave Core uses [pnpm](https://pnpm.io/) as its package manager. The minimum version is also declared in `package.json`:
+
+```json
+"packageManager": {
+  "name": "pnpm",
+  "version": ">=11.11.0",
+  "onFail": "error"
+}
+```
+
+Install pnpm via Node's Corepack (recommended):
+
+```bash
+corepack enable
+corepack prepare pnpm@latest --activate
+```
+
+Or install globally:
+
+```bash
+npm install -g pnpm
+```
+
+### depot_tools
+
+Google's `depot_tools` provides `gclient`, `gn`, `ninja`, and the managed `clang` toolchain that Chromium (and Brave) use. The `pnpm run init` script fetches `depot_tools` automatically into `vendor/depot_tools`, so you do not need to install it manually — but your `PATH` must not contain a conflicting system installation of `gn` or `ninja`.
+
+<Warning>
+  Do not add a separately installed `depot_tools` to your `PATH` before running Brave's build scripts. The scripts manage their own `depot_tools` copy to ensure version compatibility with the pinned Chromium revision.
+</Warning>
+
+## Build Configuration
+
+Some builds require additional API keys or configuration before the browser will function fully. Refer to the [Build configuration wiki page](https://github.com/brave/brave-browser/wiki/Build-configuration) for details on:
+
+- `GOOGLE_API_KEY` for Google Safe Browsing
+- Brave-internal configuration (Brave employees only)
+- Release signing configuration
+
+Once prerequisites are in place, continue to [Clone and Initialize](/getting-started/clone-and-init).

@@ -1,72 +1,159 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Brave Core",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#f35434",
+    "light": "#f35434",
+    "dark": "#f7a492"
   },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
+  "favicon": "https://media.brand.dev/3f7ac901-7466-43e0-914a-37ca32597dad.svg",
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "light": "https://media.brand.dev/725ceeaf-079f-4442-9017-5b70b96d8e28.png",
+    "dark": "https://media.brand.dev/725ceeaf-079f-4442-9017-5b70b96d8e28.png"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:support@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/brave/brave-core"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/brave/brave-core"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Getting Started",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "introduction",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Build & Setup",
+            "pages": [
+              "getting-started/prerequisites",
+              "getting-started/clone-and-init",
+              "getting-started/build",
+              "getting-started/run-and-update"
+            ]
+          },
+          {
+            "group": "Contributing",
+            "pages": [
+              "contributing/guidelines",
+              "contributing/pull-requests",
+              "contributing/localization"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Development Guides",
+        "groups": [
+          {
+            "group": "Chromium Patching",
+            "pages": [
+              "guides/patching-overview",
+              "guides/chromium-src-overrides",
+              "guides/plaster",
+              "guides/chromium-version-upgrade"
+            ]
+          },
+          {
+            "group": "WebUI Development",
+            "pages": [
+              "guides/webui-frontend",
+              "guides/webui-overriding",
+              "guides/webui-strings",
+              "guides/webui-testing"
+            ]
+          },
+          {
+            "group": "Testing",
+            "pages": [
+              "guides/running-tests",
+              "guides/adapting-chromium-tests"
+            ]
+          },
+          {
+            "group": "Build System",
+            "pages": [
+              "guides/gni-sources",
+              "guides/rust-integration",
+              "guides/siso-customization"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Features & Components",
+        "groups": [
+          {
+            "group": "Privacy & Security",
+            "pages": [
+              "features/brave-shields",
+              "features/cryptography",
+              "features/premium-account-privacy",
+              "features/tor-integration"
+            ]
+          },
+          {
+            "group": "Brave Services",
+            "pages": [
+              "features/brave-rewards",
+              "features/brave-wallet",
+              "features/brave-vpn",
+              "features/brave-ads",
+              "features/ai-chat"
+            ]
+          },
+          {
+            "group": "Platform Features",
+            "pages": [
+              "features/griffin-variations",
+              "features/p3a-analytics",
+              "features/sync",
+              "features/ipfs-web3"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Best Practices",
+        "groups": [
+          {
+            "group": "Architecture",
+            "pages": [
+              "best-practices/architecture",
+              "best-practices/coding-standards",
+              "best-practices/memory-management"
+            ]
+          },
+          {
+            "group": "Platform",
+            "pages": [
+              "best-practices/android",
+              "best-practices/ios",
+              "best-practices/frontend"
+            ]
+          },
+          {
+            "group": "Quality",
+            "pages": [
+              "best-practices/testing",
+              "best-practices/patches",
+              "best-practices/localization"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

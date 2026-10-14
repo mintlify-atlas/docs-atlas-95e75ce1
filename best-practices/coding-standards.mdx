@@ -1,0 +1,377 @@
+---
+title: "C++ Coding Standards and Style Guide for Brave Core"
+sidebarTitle: "Coding Standards"
+description: "Brave Core enforces IWYU, positive boolean naming, Maybe* prefixes, anonymous namespaces, platform buildflag usage, and strict logging and CHECK discipline across all C++ code."
+---
+
+Brave Core follows Chromium's C++ style guide and adds its own layer of enforced conventions. Code review checks for IWYU compliance, naming consistency across C++/JS/prefs layers, correct use of `CHECK` vs `DCHECK` vs `NOTREACHED`, and proper platform-split patterns. This page collects the most frequently enforced standards with the source examples used to justify them.
+
+## Includes and Header Organisation
+
+<Accordion title="CS-001: Always Include What You Use (IWYU)">
+**Always include the headers for types you directly use.** Never rely on transitive includes — they can change at any time and break your code. Also remove includes you don't use.
+
+```cpp
+// ❌ WRONG — relying on transitive includes
+#include "base/memory/ref_counted.h"
+// Uses std::string but doesn't include <string>
+
+// ✅ CORRECT — include what you use
+#include <string>
+#include "base/memory/ref_counted.h"
+```
+
+For type aliases, include the header declaring the alias, not the headers for the underlying types.
+</Accordion>
+
+<Accordion title="CS-014: Use Forward Declarations in Headers, Include in .cc">
+**Headers should forward-declare types only used as pointers or references.** Move the full `#include` to the `.cc` file.
+
+**Do not suggest forward declarations when:** the type comes transitively through a required base-class header, the type is a base class (these cannot be forward-declared), or the type is not actually used in the file.
+
+```cpp
+// ❌ WRONG — full include in header for pointer-only usage
+// my_class.h
+#include "components/foo/bar.h"
+
+// ✅ CORRECT — forward declare in header, include in .cc
+// my_class.h
+namespace foo { class Bar; }
+// my_class.cc
+#include "components/foo/bar.h"
+```
+</Accordion>
+
+<Accordion title="CS-072: Use #include Guards, Not #pragma once">
+**Every header needs a standard `#include` guard.** `#pragma once` is not allowed. The guard name is the full path from the source root, uppercased, with `/` and `.` replaced by `_`, plus a trailing `_`.
+
+```cpp
+// ❌ WRONG
+#pragma once
+
+// ✅ CORRECT — brave/components/foo/bar.h
+#ifndef BRAVE_COMPONENTS_FOO_BAR_H_
+#define BRAVE_COMPONENTS_FOO_BAR_H_
+
+...
+
+#endif  // BRAVE_COMPONENTS_FOO_BAR_H_
+```
+</Accordion>
+
+## Naming Conventions
+
+<Accordion title="CS-003: Use Positive Form for Booleans and Methods (CS-003)">
+**Always name booleans and methods in the positive form.** Negative names like `IsDisabled` or `kTorDisabled` require double negation at call sites.
+
+```cpp
+// ❌ WRONG — negative form is confusing
+bool IsTorDisabled();
+pref: kTorDisabled
+
+// ✅ CORRECT — positive form
+bool IsTorEnabled();
+pref: kTorEnabled
+```
+</Accordion>
+
+<Accordion title="CS-004: Consistent Naming Across Layers">
+**Use the same name for a concept in C++, JavaScript, prefs, and UI.** Don't arbitrarily use different names in different layers for the same concept.
+
+```cpp
+// ❌ WRONG — different names for same concept
+C++: IsTorDisabledManaged()
+JS:  getTorManaged()
+
+// ✅ CORRECT — consistent naming
+C++: IsTorManaged()
+JS:  isTorManaged()
+```
+</Accordion>
+
+<Accordion title="CS-005: Use Conventional Method Prefixes">
+**Follow the prefix convention for method roles:**
+- `Should*` for boolean queries (not `Get*` for bool queries)
+- `Record*` for histogram and P3A recording
+- `Load*` / `Save*` pairs for persistence
+- `Maybe*` for conditional actions (CS-008)
+
+```cpp
+// ❌ WRONG
+bool GetShouldShowBrandedWallpaper();
+void SendSavingsDaily();
+
+// ✅ CORRECT
+bool ShouldShowBrandedWallpaper();
+void RecordSavingsDaily();
+void LoadSavingsDaily();
+void SaveSavingsDaily();
+```
+</Accordion>
+
+<Accordion title="CS-007: Only Use Brave* Prefix When Overriding Chromium">
+**Only add the `Brave*` prefix to class names when overriding or subclassing a Chromium class.** For purely Brave-originated code, use the feature name directly.
+
+```cpp
+// ❌ WRONG — Brave prefix on a new Brave-only class
+class BraveWebcompatReporterService { ... };
+
+// ✅ CORRECT — no prefix for Brave-only code
+class WebcompatReporterService { ... };
+
+// ✅ CORRECT — Brave prefix when overriding Chromium
+class BraveOmniboxClientImpl : public ChromeOmniboxClient { ... };
+```
+
+The filename should match the class name: `WebcompatReporterService` → `webcompat_reporter_service.h`.
+</Accordion>
+
+<Accordion title="CS-008: Use Maybe* Prefix for Conditional Actions">
+**Use `Maybe*` for functions that might not do anything depending on runtime conditions.**
+
+```cpp
+// ❌ WRONG — sounds like it always shows
+void ShowFirstLaunchNotification();
+
+// ✅ CORRECT — clearly communicates conditionality
+void MaybeShowFirstLaunchNotification();
+void MaybeHideReferrer();
+```
+</Accordion>
+
+<Accordion title="CS-009: C++ Variables Use snake_case, Not camelCase">
+**C++ variables use underscores (snake_case). camelCase is only for class names and method names.**
+
+```cpp
+// ❌ WRONG
+bool isTorDisabled = false;
+std::string userName;
+
+// ✅ CORRECT
+bool is_tor_disabled = false;
+std::string user_name;
+```
+</Accordion>
+
+## Copyright and File Rules
+
+<Accordion title="CS-011 / CS-012: Copyright Rules">
+**Never copy a Chromium file and apply Brave's copyright.** If you copy or derive from Chromium code, include their copyright notice. The original year must not be changed — don't bump existing copyright years.
+
+**New files must use the current calendar year.** Never copy-paste old copyright years from other files; always determine the year from the system date.
+</Accordion>
+
+## Header Content Rules
+
+<Accordion title="CS-013: Don't Define Methods in Headers">
+**Move method definitions to `.cc` files.** Exceptions: simple inline accessors (snake_case name, never virtual), `constexpr` constants, and `*ForTesting()` accessors.
+
+```cpp
+// ❌ WRONG — method body in header
+class RewardsProtocolHandler {
+  static bool HandleURL(const GURL& url) {
+    return url.scheme() == "rewards";
+  }
+};
+
+// ❌ WRONG — virtual function declared inline
+class Handler {
+  virtual bool IsEnabled() const { return enabled_; }
+};
+
+// ✅ CORRECT — declaration in header, definition in .cc
+// header
+bool HandleRewardsProtocol(const GURL& url);
+
+// .cc
+bool HandleRewardsProtocol(const GURL& url) {
+  return url.scheme() == "rewards";
+}
+
+// ✅ CORRECT — simple accessor stays inline
+class RewardsService {
+ public:
+  bool is_enabled() const { return is_enabled_; }
+ private:
+  bool is_enabled_ = false;
+};
+```
+</Accordion>
+
+<Accordion title="CS-016: Use Anonymous Namespaces for Internal Code">
+**If a function or class is internal to a `.cc` file, put it in an anonymous namespace.** Do not use `static` on free functions.
+
+```cpp
+// ❌ WRONG — internal helper with static
+static void InternalHelper() { ... }
+
+// ✅ CORRECT — anonymous namespace
+namespace {
+void InternalHelper() { ... }
+}  // namespace
+```
+
+Also: do not add `static` to `constexpr` values inside anonymous namespaces — the namespace already provides internal linkage.
+
+```cpp
+// ❌ WRONG — redundant static
+namespace {
+static constexpr int kMaxRetries = 3;
+}
+
+// ✅ CORRECT
+namespace {
+constexpr int kMaxRetries = 3;
+}
+```
+</Accordion>
+
+## Assertions and Error Handling
+
+<Accordion title="CS-025 / CS-026 / CS-027: CHECK, DCHECK, and NOTREACHED">
+**Use the right primitive for the right situation.** See the Chromium [checks guide](https://chromium.googlesource.com/chromium/src/+/main/styleguide/c++/checks.md).
+
+| Primitive | Behavior | Use for |
+|---|---|---|
+| `CHECK(cond)` | Crashes in all builds | Invariants within the code's control |
+| `DCHECK(cond)` | Debug-only | Invariants too expensive to verify in production |
+| `NOTREACHED()` | Crashes; terminates control flow | Genuinely unreachable code |
+| `base::debug::DumpWithoutCrashing()` | Uploads a report, keeps running | Investigating a failure without killing the browser |
+
+```cpp
+// ❌ WRONG — crashes on data from an external source
+CHECK(db_value.has_value());  // Data from database!
+
+// ✅ CORRECT — graceful handling of external data
+if (!db_value.has_value()) {
+  DLOG(ERROR) << "Missing expected database value";
+  return std::nullopt;
+}
+
+// ✅ CORRECT — prefer unconditional CHECK over conditional NOTREACHED
+CHECK(profile);
+
+// ✅ CORRECT — return optional for non-security enum mismatch
+std::optional<mojom::AdType> ToMojomAdType(const std::string& type) {
+  // ...
+  return std::nullopt;  // Caller handles gracefully
+}
+```
+</Accordion>
+
+## Logging Guidelines
+
+<Accordion title="CS-042 / CS-044 / CS-045 / CS-048: Logging Best Practices">
+Use the right log level for the situation:
+
+- **`VLOG(n)`** — debug logging that stays in the codebase; level-checked automatically, no `VLOG_IS_ON` needed
+- **`LOG(WARNING)`** — noteworthy but non-critical failures
+- **`LOG(ERROR)`** — truly unexpected and serious failures only
+- **`DLOG(ERROR)`** — non-critical errors in debug builds only
+- **`DVLOG(1)`** — retained debug logging that avoids release binary bloat
+
+```cpp
+// ❌ WRONG — LOG(ERROR) for a non-critical parse failure
+LOG(ERROR) << "Failed to parse filter list";
+
+// ✅ CORRECT
+VLOG(1) << "Failed to parse filter list";
+
+// ❌ WRONG — unnecessary VLOG_IS_ON check
+if (VLOG_IS_ON(2)) {
+  VLOG(2) << "Some message";
+}
+
+// ✅ CORRECT — VLOG checks level internally
+VLOG(2) << "Some message";
+
+// ❌ WRONG — logging sensitive data
+VLOG(1) << "Sync seed: " << sync_seed;
+
+// ✅ CORRECT
+VLOG(1) << "Sync seed set successfully";
+```
+</Accordion>
+
+## Platform-Specific Code
+
+<Accordion title="CS-033 / CS-034: Platform Splitting and Feature vs Platform Checks">
+**When a method's implementation differs entirely across platforms, split it into a separate file** (`my_class_android.cc`) rather than using `#if BUILDFLAG` blocks throughout the main file.
+
+**Always use buildflags from `build/build_config.h`** — never compiler-provided macros.
+
+```cpp
+// ❌ WRONG — compiler macro
+#if defined(WIN32)
+
+// ❌ WRONG — OS_ANDROID was removed
+#if defined(OS_ANDROID)
+
+// ✅ CORRECT
+#include "build/build_config.h"
+#if BUILDFLAG(IS_ANDROID)
+```
+
+Prefer feature checks over platform checks when the behaviour is feature-dependent, not platform-dependent:
+
+```cpp
+// ❌ WRONG — platform check for feature behaviour
+#if BUILDFLAG(IS_ANDROID)
+  // Don't show notifications
+#endif
+
+// ✅ CORRECT — feature check
+if (IsDoNotDisturbEnabled()) {
+  // Don't show notifications
+}
+```
+</Accordion>
+
+## Additional Style Rules
+
+<Accordion title="CS-019: Comments Must Make Sense Without PR Context">
+**Every comment must be meaningful to someone reading the code fresh, with no knowledge of the PR.** Don't add comments referencing removed code, prior behaviour, or the change itself. Keep a comment only when it explains a genuinely non-obvious constraint the code cannot express itself.
+
+```cpp
+// ❌ WRONG — references removed code
+// Removed the old caching logic that was causing race conditions.
+// Previously this used a raw pointer, now using unique_ptr.
+
+// ✅ CORRECT — explains current non-obvious behaviour
+// Workaround for https://crbug.com/123456 — upstream doesn't handle
+// the case where X is null. Remove when the upstream fix lands.
+if (!x) return;
+```
+</Accordion>
+
+<Accordion title="CS-036 / CS-050: No Static Variables for Per-Profile State; Prefer GlobalFeatures Over NoDestructor">
+**Never use static variables to store per-profile settings.** Static state is shared across all profiles and causes incorrect behaviour in multi-profile scenarios.
+
+**For global services, prefer registering in `GlobalFeatures`** over `base::NoDestructor`. `NoDestructor` makes testing difficult since you can't reset the instance between tests.
+</Accordion>
+
+<Accordion title="CS-063: Use constexpr for Compile-Time TimeDelta Constants">
+**Declare time constants as `constexpr base::TimeDelta`** rather than just `const`. The factory functions (`base::Milliseconds()`, `base::Seconds()`) are constexpr-capable.
+
+```cpp
+// ❌ WRONG — runtime initialization
+const base::TimeDelta kAnimationDuration = base::Milliseconds(200);
+
+// ✅ CORRECT — compile-time constant
+constexpr base::TimeDelta kAnimationDuration = base::Milliseconds(200);
+```
+</Accordion>
+
+<Accordion title="CS-057: Validate and Sanitize Data Before Injecting as JavaScript">
+**When constructing JavaScript from C++ data for injection, use JSON serialization.** String concatenation can lead to injection vulnerabilities.
+
+```cpp
+// ❌ WRONG — string concatenation
+std::string script = "const selectors = [`" + selector + "`];";
+
+// ✅ CORRECT — JSON serialization
+std::string json_selectors;
+base::JSONWriter::Write(selectors_list, &json_selectors);
+std::string script = "const selectors = " + json_selectors + ";";
+```
+</Accordion>

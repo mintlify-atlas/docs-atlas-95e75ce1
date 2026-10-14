@@ -1,0 +1,653 @@
+---
+title: "Testing Best Practices: Isolation, Async, and Navigation Tests"
+sidebarTitle: "Testing"
+description: "Brave Core testing philosophy: async synchronization, test isolation, JavaScript evaluation, navigation patterns, mock strategies, and flake prevention."
+---
+
+Brave Core tests span C++ unit tests, browser tests, Robolectric tests, and WebUI component tests. The guidelines below are drawn from recurring review patterns across all four domains. They address the most important class of test bugs: false passes (tests that always pass but prove nothing), flaky tests (caused by timing shortcuts), and cascading failures (caused by shared state leaking between test cases).
+
+<Tabs>
+  <Tab title="Isolation">
+
+## Test Isolation Principles
+
+Good tests are independent — they neither depend on execution order nor leave state that affects subsequent tests. Isolation failures are among the most costly bugs in a test suite because they produce non-deterministic results that waste engineering time.
+
+### Use fakes over real dependencies
+
+Prefer fakes over real dependencies. This prevents cascading test failures, produces more maintainable code, and makes tests faster and more deterministic.
+
+```cpp
+// ✅ CORRECT - Control exact timing with MockTool
+auto mock_tool = std::make_unique<MockTool>();
+EXPECT_CALL(*mock_tool, Execute(_, _))
+    .WillOnce([&](auto data, auto callback) {
+      tool_callback = std::move(callback);
+    });
+
+// Now we can control exactly when the tool completes
+ClickPauseButton();
+std::move(tool_callback).Run(/* result */);
+```
+
+### Test the API, not the implementation
+
+Focus on public interfaces. This allows internal implementation changes without breaking tests and provides accurate usage examples.
+
+```cpp
+// ❌ WRONG - testing internal implementation details
+EXPECT_EQ(object->private_state_, 42);
+
+// ✅ CORRECT - testing public API behavior
+EXPECT_TRUE(object->IsReady());
+EXPECT_EQ(object->GetValue(), 42);
+```
+
+### HTTP Request Testing — Per-Domain Expected Values
+
+When testing HTTP headers from pages with subresources, use per-domain maps to prevent race conditions.
+
+```cpp
+// ❌ WRONG - global expected value, race condition with subresources
+std::string expected_header_;
+
+void OnRequest(const HttpRequest& request) {
+  EXPECT_EQ(request.headers["Accept-Language"], expected_header_);
+}
+
+// ✅ CORRECT - per-domain expected values
+std::map<std::string, std::string> expected_headers_;
+
+void SetExpectedHeader(const std::string& domain, const std::string& value) {
+  expected_headers_[domain] = value;
+}
+
+void OnRequest(const HttpRequest& request) {
+  std::string domain = ExtractDomain(request.headers["Host"]);
+  EXPECT_EQ(request.headers["Accept-Language"], expected_headers_[domain]);
+}
+```
+
+Subresource requests can arrive out-of-order, so per-resource expected values prevent races.
+
+### Re-enable test-only globals in TearDown
+
+When a test disables functionality via a global in `SetUp()`, always re-enable it in `TearDown()` to avoid leaking state.
+
+```cpp
+// ❌ WRONG - leaks state to other tests
+void SetUp() { g_disable_auto_start = true; }
+
+// ✅ CORRECT - restore state
+void SetUp() { g_disable_auto_start = true; }
+void TearDown() { g_disable_auto_start = false; }
+```
+
+### Don't depend on //chrome from components tests
+
+Component-level unit tests must not depend on `//chrome`. Create needed objects manually in the test.
+
+```cpp
+// ❌ WRONG - depending on //chrome from components test
+#include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+auto* settings_map = HostContentSettingsMapFactory::GetForProfile(profile);
+
+// ✅ CORRECT - create the instance directly
+auto settings_map = base::MakeRefCounted<HostContentSettingsMap>(
+    &pref_service_, false /* is_off_the_record */,
+    false /* store_last_modified */, false /* restore_session*/,
+    false /* should_record_metrics */);
+```
+
+### Prefer `*_for_testing()` accessors over FRIEND_TEST
+
+When tests need access to a single private member, provide a `*_for_testing()` accessor rather than adding multiple `FRIEND_TEST` macros.
+
+```cpp
+// ❌ WRONG - proliferating FRIEND_TEST macros
+class BraveTab {
+  FRIEND_TEST_ALL_PREFIXES(BraveTabTest, RenameBasic);
+  FRIEND_TEST_ALL_PREFIXES(BraveTabTest, RenameCancel);
+  raw_ptr<views::Textfield> rename_textfield_;
+};
+
+// ✅ CORRECT - single accessor
+class BraveTab {
+  views::Textfield& rename_textfield_for_testing() { return *rename_textfield_; }
+  raw_ptr<views::Textfield> rename_textfield_;
+};
+```
+
+### Use DETACH_FROM_SEQUENCE() in database constructors
+
+Database classes that use `SEQUENCE_CHECKER` should call `DETACH_FROM_SEQUENCE(sequence_checker_)` in their constructor to allow re-binding in mock-based tests.
+
+```cpp
+// ❌ WRONG - sequence checker binds to construction thread
+MyDatabase::MyDatabase() {
+  // sequence_checker_ bound to current thread
+}
+
+// ✅ CORRECT - detach so it re-binds on first use
+MyDatabase::MyDatabase() {
+  DETACH_FROM_SEQUENCE(sequence_checker_);
+}
+```
+
+### Use chromium_src include pattern to test upstream overrides
+
+When overriding upstream Chromium code via `chromium_src`, include the upstream test file and add Brave-specific tests after it.
+
+```cpp
+// chromium_src/components/foo/foo_service_unittest.cc
+
+// Include the entire upstream test file — all its tests will run.
+#include <components/foo/foo_service_unittest.cc>
+
+namespace foo {
+
+// Add Brave-specific tests using the upstream fixtures and mocks.
+TEST_F(FooServiceTest, BraveSpecificBehavior) {
+  // Tests Brave-specific logic that was added via chromium_src override
+}
+
+}  // namespace foo
+```
+
+Good examples in the repo: `chromium_src/components/sync/engine/sync_scheduler_impl_unittest.cc` and `chromium_src/components/ntp_tiles/most_visited_sites_unittest.cc`.
+
+  </Tab>
+  <Tab title="Async">
+
+## Async Testing Patterns
+
+The single most important rule for async tests: never make timing-based "fixes." A change that works by altering when things execute is not a fix — it hides the race condition until the next time timing shifts.
+
+### Never make timing-based "fixes"
+
+```cpp
+// ❌ ALL OF THESE ARE BANNED - they alter timing, not synchronization
+LOG(INFO) << "Debug output";            // Changes timing!
+volatile int dummy = 0;
+for (int i = 0; i < 100; i++) { dummy++; }  // Delay tactic
+std::this_thread::yield();              // Still a timing hack
+auto unused = SomeGetter();             // Adds execution time
+SomeUnrelatedFunction();                // Accidentally changes timing
+```
+
+**Rule of thumb:** If removing your "fix" would make the test flaky again, but you can't explain WHY it fixes the race condition, it's not a real fix.
+
+Real fixes are:
+- **Deterministic** — work every time
+- **Explainable** — you can describe the synchronization mechanism
+- **Robust** — work across different timing conditions, platforms, and build types
+
+### Never use RunUntilIdle()
+
+`RunLoop::RunUntilIdle()` is explicitly forbidden by the Chromium style guide. It may run too long, return too early if events depend on different task queues, or create unreliable tests.
+
+### Use base::test::RunUntil() for C++ conditions
+
+```cpp
+// ✅ CORRECT - wait for the actual condition
+ASSERT_TRUE(base::test::RunUntil([th]() {
+  return speedreader::IsDistilled(th->PageDistillState());
+}));
+
+// ✅ CORRECT - checking object properties
+ASSERT_TRUE(base::test::RunUntil([this]() {
+  return tab_helper()->speedreader_bubble_view() != nullptr;
+}));
+```
+
+<Warning>
+  Do not call operations that create their own run loops inside `base::test::RunUntil()`. These include `content::EvalJs()`, `content::ExecJs()`, and IPC operations that wait for responses. Only direct C++ state checks and simple getter methods are safe inside `RunUntil`.
+</Warning>
+
+### Always use TestFuture over RunLoop for callbacks
+
+`TestFuture` is more concise and less error-prone than `RunLoop` patterns. Reviewers actively enforce this.
+
+```cpp
+// ❌ WRONG - verbose RunLoop + lambda pattern (will be flagged in review)
+base::RunLoop run_loop;
+bool result = false;
+service->CheckPurchaseState(
+    base::BindLambdaForTesting([&](bool is_purchased) {
+      result = is_purchased;
+      run_loop.Quit();
+    }));
+run_loop.Run();
+EXPECT_FALSE(result);
+
+// ✅ CORRECT - TestFuture is simpler and cleaner
+base::test::TestFuture<bool> future;
+service->CheckPurchaseState(future.GetCallback());
+EXPECT_FALSE(future.Get());
+```
+
+### Mojo message ordering for test synchronization
+
+Mojo processes messages in order on a given interface. Making a synchronous Mojo call through an interface guarantees that all prior async messages on that same interface have been processed.
+
+```cpp
+// ❌ WRONG - polling with arbitrary delay
+base::PlatformThread::Sleep(base::Milliseconds(100));
+
+// ✅ CORRECT - use sync mojo call to ensure prior messages processed
+// isConnected() synchronously ensures prior async Init() completed first
+EXPECT_EQ(true, content::EvalJs(web_contents,
+    "window.braveSolana.isConnected"));
+```
+
+### Wait for Mojo completion before EvalJs assertions
+
+Do not call `EvalJs` immediately after an async Mojo operation to check its effects.
+
+```cpp
+// ❌ WRONG - EvalJs races with pending mojo response
+service->UpdateSettings(new_settings);
+EXPECT_EQ(true, content::EvalJs(web_contents, "isSettingEnabled()"));
+
+// ✅ CORRECT - wait for mojo to complete first
+base::test::TestFuture<bool> future;
+service->UpdateSettings(new_settings, future.GetCallback());
+EXPECT_TRUE(future.Get());
+EXPECT_EQ(true, content::EvalJs(web_contents, "isSettingEnabled()"));
+```
+
+### Test all feature flag combinations
+
+When testing a class affected by multiple `base::Feature` flags, use value-parameterized tests to cover all 2^N flag combinations.
+
+```cpp
+namespace {
+const std::vector<base::test::FeatureRef> kTestFeatures = {
+    features::kFlagA, features::kFlagB, features::kFlagC};
+}  // namespace
+
+// Generates 2^3 = 8 test instances, one per combination
+INSTANTIATE_TEST_SUITE_P(
+    All, MyFeatureTest,
+    testing::Range<size_t>(0, 1 << kTestFeatures.size()));
+
+class MyFeatureTest : public testing::TestWithParam<size_t> {
+ protected:
+  void SetUp() override {
+    std::vector<base::test::FeatureRef> enabled, disabled;
+    for (size_t i = 0; i < kTestFeatures.size(); i++) {
+      (GetParam() & (size_t{1} << i) ? enabled : disabled)
+          .push_back(kTestFeatures[i]);
+    }
+    scoped_feature_list_.InitWithFeatures(enabled, disabled);
+  }
+  base::test::ScopedFeatureList scoped_feature_list_;
+};
+
+TEST_P(MyFeatureTest, BehaviorIsCorrectForAllFlagCombinations) {
+  // Test logic runs under every flag combination automatically
+}
+```
+
+### Never let tests depend on a feature flag's current default
+
+A test must never rely on the compiled-in default of a `base::Feature`. Pin every flag whose behavior the test depends on, or parameterize over both states.
+
+```cpp
+// ❌ WRONG - deleting "now redundant" setup because the new default enables it
+class MyCachingTest : public MyTestBase {
+  // MyCachingTest() { feature_list_.InitAndEnableFeature(kMyCache); } <- removed
+};
+
+// ✅ CORRECT - parameterize so the test runs for both states
+class MyCachingTest : public testing::TestWithParam<bool> {
+ public:
+  MyCachingTest() {
+    feature_list_.InitWithFeatureState(features::kMyCache, GetParam());
+  }
+ private:
+  base::test::ScopedFeatureList feature_list_;
+};
+
+TEST_P(MyCachingTest, NotifiesWhenReady) {
+  const bool cache_enabled = GetParam();
+  EXPECT_EQ(observer.changed_count, cache_enabled ? 0 : 1);
+}
+
+INSTANTIATE_TEST_SUITE_P(All, MyCachingTest, testing::Bool(),
+                         [](const testing::TestParamInfo<bool>& info) {
+                           return info.param ? "CacheEnabled" : "CacheDisabled";
+                         });
+```
+
+<Note>
+  Initialize `ScopedFeatureList` in the **constructor**, not `SetUp()`. The fixture constructor runs before `SetUp()`, ensuring no flag-reading code is constructed before the flag state is set. `GetParam()` is already available in the constructor.
+</Note>
+
+  </Tab>
+  <Tab title="JavaScript Tests">
+
+## JavaScript Evaluation in Tests
+
+### Prefer event-driven JavaScript over C++ polling
+
+When waiting for DOM changes, prefer JavaScript event-driven patterns (like `MutationObserver`) over C++ polling loops. Event-driven patterns respond immediately when the event occurs and avoid wasted CPU cycles.
+
+```cpp
+// ✅ CORRECT - MutationObserver for DOM changes
+// Pattern from Chromium's service_worker_internals_ui_browsertest.cc
+static constexpr char kWaitForTextScript[] = R"(
+  (function() {
+    const element = document.getElementById($1);
+    const expected = $2;
+
+    function getText() {
+      return element.tagName === 'INPUT' || element.tagName === 'TEXTAREA'
+          ? element.value : element.innerText;
+    }
+
+    if (getText() === expected) {
+      return getText();
+    }
+
+    return new Promise(function(resolve) {
+      const observer = new MutationObserver(function() {
+        if (getText() === expected) {
+          observer.disconnect();
+          resolve(getText());
+        }
+      });
+      observer.observe(element,
+          {childList: true, subtree: true, characterData: true});
+    });
+  })()
+)";
+std::string updated_text =
+    content::EvalJs(web_contents,
+                    content::JsReplace(kWaitForTextScript,
+                                       element_id,
+                                       expected_text))
+        .ExtractString();
+```
+
+### Manual polling loop (fallback)
+
+Use C++ polling only when JavaScript event-driven patterns aren't applicable (e.g., checking for element existence, waiting for JS API readiness).
+
+```cpp
+const base::TimeTicks deadline = base::TimeTicks::Now() + base::Seconds(10);
+for (;;) {
+  NonBlockingDelay(base::Milliseconds(10));
+  if (content::EvalJs(web_contents, "!!document.getElementById('foo')",
+                      content::EXECUTE_SCRIPT_DEFAULT_OPTIONS,
+                      ISOLATED_WORLD_ID_BRAVE_INTERNAL)
+          .ExtractBool()) {
+    break;
+  }
+  if (base::TimeTicks::Now() >= deadline) {
+    FAIL() << "Timeout waiting for element";
+  }
+}
+```
+
+### Use isolated worlds for test code
+
+When evaluating JavaScript in tests, use `ISOLATED_WORLD_ID_BRAVE_INTERNAL` to avoid interfering with page scripts.
+
+```cpp
+content::EvalJs(web_contents, "document.getElementById('foo')",
+                content::EXECUTE_SCRIPT_DEFAULT_OPTIONS,
+                ISOLATED_WORLD_ID_BRAVE_INTERNAL)
+```
+
+### Wait for renderer-side JS setup
+
+Mojo binding completes before JavaScript event emitter setup. When testing JS APIs, poll explicitly for JS API readiness.
+
+```cpp
+// ❌ WRONG - WaitForSolanaProviderBinding only waits for mojo, not JS
+WaitForSolanaProviderBinding();
+// window.braveSolana.on might not be ready yet!
+
+// ✅ CORRECT - Manual polling for JS API readiness
+const base::TimeTicks deadline = base::TimeTicks::Now() + base::Seconds(5);
+for (;;) {
+  NonBlockingDelay(base::Milliseconds(10));
+  if (content::EvalJs(web_contents,
+                      "typeof window.braveSolana?.on === 'function'",
+                      content::EXECUTE_SCRIPT_DEFAULT_OPTIONS,
+                      ISOLATED_WORLD_ID_BRAVE_INTERNAL)
+          .ExtractBool()) {
+    break;
+  }
+  if (base::TimeTicks::Now() >= deadline) {
+    FAIL() << "Timeout waiting for braveSolana.on";
+  }
+}
+```
+
+### Always check EvalJs results
+
+When using `EvalJs` in tests, always check the result with `EXPECT_TRUE`/`EXPECT_EQ`. An unchecked `EvalJs` call silently swallows errors.
+
+```cpp
+// ❌ WRONG - unchecked EvalJs, silently ignores exceptions
+content::EvalJs(web_contents, "window.solana.isConnected");
+
+// ✅ CORRECT - result checked
+EXPECT_EQ(true, content::EvalJs(web_contents,
+                                "window.solana.isConnected"));
+```
+
+  </Tab>
+  <Tab title="Navigation Tests">
+
+## Navigation and Timing
+
+### Same-document navigation
+
+Do not use `base::test::RunUntil()` polling for same-document (hash/fragment) navigations. Standard `TestNavigationObserver` skips same-document navigations. Use a custom observer:
+
+```cpp
+class SameDocumentCommitObserver : public content::WebContentsObserver {
+ public:
+  explicit SameDocumentCommitObserver(content::WebContents* web_contents)
+      : content::WebContentsObserver(web_contents) {}
+
+  void Wait() { run_loop_.Run(); }
+
+ private:
+  void DidFinishNavigation(content::NavigationHandle* handle) override {
+    if (handle->IsSameDocument() && !handle->IsErrorPage()) {
+      run_loop_.Quit();
+    }
+  }
+
+  base::RunLoop run_loop_;
+};
+
+// Usage:
+SameDocumentCommitObserver observer(web_contents);
+// Trigger navigation...
+observer.Wait();
+```
+
+### Avoid hardcoded JavaScript timeouts
+
+```cpp
+// ❌ WRONG - unreliable hardcoded timeout
+content::EvalJs(web_contents, R"(
+  setTimeout(() => { /* wait for something */ }, 1200);
+)");
+
+// ✅ CORRECT - wait for actual condition in C++
+ASSERT_TRUE(base::test::RunUntil([&]() {
+  return template_url_service->GetTemplateURLForHost(host) != nullptr;
+}));
+```
+
+### Throttle testing — use large throttle windows
+
+Throttle timers start when a fetch happens, not when test timing checks begin.
+
+```cpp
+// ❌ WRONG - 500ms throttle, but WaitForSelector might take 250ms!
+const int kThrottleMs = 500;
+WaitForSelectorBlocked();  // May take 200-300ms
+NonBlockingDelay(base::Milliseconds(250));  // Checking too early!
+
+// ✅ CORRECT - large throttle window accounts for polling time
+const int kThrottleMs = 2000;
+WaitForSelectorBlocked();  // Takes ~200-300ms
+NonBlockingDelay(base::Milliseconds(1000));  // Still well within throttle
+```
+
+Polling-based waits consume time from the throttle window, so use throttle times much larger than expected polling durations.
+
+### Wait for page distillation
+
+When testing distilled content (Speedreader), always wait for distillation to complete before interacting with content.
+
+```cpp
+NavigateToPageSynchronously(url);
+WaitDistilled();  // Wait for distillation before interacting with content
+// Now safe to interact with distilled elements
+```
+
+`NavigateToPageSynchronously` only waits for load stop, not for distillation.
+
+### Confirm the test exists in the binary before trusting a pass
+
+A `--gtest_filter` that matches nothing is not an error. The launcher prints a warning, reports success, and exits `0` — indistinguishable from a real pass in a CI log.
+
+```bash
+# Should list the tests you expect. Empty output = they are not in this binary.
+./out/<dir>/brave_browser_tests --gtest_list_tests --gtest_filter='MyTest.*'
+```
+
+A real pass prints a `[ RUN ]` / `[ OK ]` pair per test with a non-zero duration. `Tests took 0 seconds` for a browser test means nothing ran. Several test targets are buildflag-gated, so a locally configured build can omit them entirely.
+
+  </Tab>
+</Tabs>
+
+## General Test Quality Rules
+
+These rules apply across all test domains.
+
+<CardGroup cols={2}>
+  <Card title="ASSERT for Preconditions" icon="shield-halved">
+    Use `ASSERT_*` (fatal) when a failed check would cause crashes or confusing secondary failures in later code. Use `EXPECT_*` (non-fatal) when subsequent checks are independent (TI-034).
+  </Card>
+  <Card title="Diagnostic State in Assertions" icon="magnifying-glass">
+    Include diagnostic context using the `<<` operator so failures are debuggable without re-running under a debugger (TI-014).
+  </Card>
+  <Card title="Descriptive Test Names" icon="tag">
+    Test method names should be long and descriptive enough to explain the scenario without reading the test body (TI-038).
+  </Card>
+  <Card title="Bug-Fix Tests" icon="bug">
+    Every bug-fix PR should include a test that reproduces the specific bug scenario being fixed. The test should fail without the fix and pass with it (TI-030).
+  </Card>
+</CardGroup>
+
+<Accordion title="Verify tests actually test what they claim">
+
+When using test-only controls (globals, mocks, feature overrides), verify the test still exercises the code path it claims to test. A test that disables the code under test proves nothing.
+
+```cpp
+// ❌ WRONG - test disables the code it claims to test
+void SetUp() { g_disable_stats_for_testing = true; }
+// "The stats updater should not reach the endpoint"
+// But we disabled stats entirely — this test proves nothing!
+
+// ✅ CORRECT - test the actual behavior with a mock server
+```
+
+</Accordion>
+
+<Accordion title="Use ParseJsonDict for JSON test comparisons">
+
+In tests comparing JSON values, use `base::test::ParseJsonDict()` for simpler, more readable assertions. Never use `testing::HasSubstr` to validate JSON — it is fragile and doesn't verify structure.
+
+```cpp
+// ❌ WRONG - substring matching on JSON
+EXPECT_THAT(json_str, testing::HasSubstr("\"role\":\"user\""));
+
+// ❌ WRONG - manually building expected dict
+base::Value::Dict expected;
+expected.Set("method", "chain_getBlockHash");
+expected.Set("id", 1);
+EXPECT_EQ(actual, expected);
+
+// ✅ CORRECT - parse from string
+EXPECT_EQ(actual, base::test::ParseJsonDict(
+    R"({"method":"chain_getBlockHash","id":1})"));
+```
+
+</Accordion>
+
+<Accordion title="Use SCOPED_TRACE with base::Location in browser test helpers">
+
+Use `SCOPED_TRACE(base::Location::Current())` in browser test helper functions to get file/line information in failure output.
+
+```cpp
+// ❌ WRONG - failure points to helper, not caller
+void VerifyTabCount(Browser* browser, int expected) {
+  EXPECT_EQ(browser->tab_strip_model()->count(), expected);
+}
+
+// ✅ CORRECT - failure shows caller location
+void VerifyTabCount(Browser* browser, int expected,
+                    base::Location location = base::Location::Current()) {
+  SCOPED_TRACE(location.ToString());
+  EXPECT_EQ(browser->tab_strip_model()->count(), expected);
+}
+```
+
+</Accordion>
+
+<Accordion title="Use parameterized tests for similar scenarios">
+
+When testing multiple similar scenarios with different inputs/outputs, use parameterized tests instead of separate test functions.
+
+```cpp
+// ❌ WRONG - separate tests for each variation
+TEST_F(MyTest, HandleTypeA) { ... }
+TEST_F(MyTest, HandleTypeB) { ... }
+TEST_F(MyTest, HandleTypeC) { ... }
+
+// ✅ CORRECT - parameterized with SCOPED_TRACE
+struct TestCase {
+  std::string name;
+  ActionType type;
+  std::string expected;
+};
+
+TEST_F(MyTest, HandleAllTypes) {
+  const TestCase cases[] = {
+    {"TypeA", ActionType::kA, "expected_a"},
+    {"TypeB", ActionType::kB, "expected_b"},
+    {"TypeC", ActionType::kC, "expected_c"},
+  };
+  for (const auto& tc : cases) {
+    SCOPED_TRACE(tc.name);
+    EXPECT_EQ(Handle(tc.type), tc.expected);
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="Use ASSERT_TRUE before accessing optional values">
+
+In tests, use `ASSERT_TRUE(optional.has_value())` before accessing an optional's value. Do not use `value_or("")` as a fallback — it hides bugs.
+
+```cpp
+// ❌ WRONG - hides missing values
+EXPECT_EQ(map[entry->uuid.value_or("")], expected_content);
+
+// ✅ CORRECT - fail fast on missing value
+ASSERT_TRUE(entry->uuid.has_value());
+EXPECT_EQ(map[*entry->uuid], expected_content);
+```
+
+</Accordion>

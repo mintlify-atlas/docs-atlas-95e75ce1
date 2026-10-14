@@ -1,0 +1,164 @@
+---
+title: "Running and Updating Your Brave Core Build"
+sidebarTitle: "Run & Update"
+description: "How to launch a built Brave binary with pnpm start, sync your checkout with pnpm run sync, and manage branches across different development scenarios."
+---
+
+Once you have a successful build, launching Brave and keeping your development tree up to date are both handled through the same `pnpm` scripts that managed the build. This page covers starting the browser, understanding the `sync` workflow, and the branch management patterns you'll use day-to-day.
+
+## Running the Browser
+
+Use `pnpm start` to launch the browser from a compiled output directory. You can optionally specify which build configuration to run:
+
+```bash
+# Launch the default Component build
+pnpm start
+
+# Launch a specific configuration
+pnpm start Release
+pnpm start Component
+pnpm start Static
+pnpm start Debug
+```
+
+`pnpm start` locates the correct executable in `src/out/<config>/` for your platform and launches it with sensible development flags. You can pass additional Chromium command-line switches after the configuration name.
+
+## Updating Your Checkout
+
+`pnpm run sync` is the primary command for keeping your checkout current. It handles updating Chromium, re-applying patches, refreshing `gclient` DEPS dependencies, and re-running hooks — all in the right order.
+
+```bash
+pnpm run sync [--force] [--init] [--sync_chromium=true|false] [-D] [brave_core_ref]
+```
+
+<Warning>
+  `pnpm run sync` will attempt to stash your local changes in `brave-core`, but it is safer to **commit your local changes** before running sync. Unstashed changes on patch-managed files may be lost.
+</Warning>
+
+### Sync Flag Reference
+
+| Flag | What it does |
+|---|---|
+| *(no flags)* | Updates Chromium only if the pinned version changed; re-applies only changed patches; updates child deps only if any project was updated. Best for routine syncing. |
+| `--force` | Forces both Chromium and `brave-core` to the latest remote commit for the current branch. Re-applies **all** patches. Force-updates all child deps. Use when your tree is broken. |
+| `--init` | Identical to `pnpm run init` — resets everything to the versions in `package.json`. Longer build required; pending `brave-core` changes are removed. |
+| `--sync_chromium=true` | Forces a Chromium version update even if the version appears current. |
+| `--sync_chromium=false` | Skips the Chromium version update. Useful to defer a large Chromium update. A warning will be shown; the build may fail. |
+| `-D` / `--delete_unused_deps` | Deletes dependencies removed since the last sync (mirrors `gclient sync -D`). |
+| `brave_core_ref` | Checks out the specified `brave-core` ref (branch or tag) and updates all dependent repos. |
+
+## Typical Update Workflow
+
+The following steps cover the most common daily workflow: pulling the latest changes from `brave-core` and syncing the rest of the tree.
+
+<Steps>
+  <Step title="Commit or stash any local changes">
+    Make sure your working directory in `src/brave` is clean before syncing. Commit your in-progress work to a branch or stash it with `git stash`.
+
+    ```bash
+    cd src/brave
+    git add -A && git commit -m "WIP: my feature"
+    # or: git stash
+    ```
+  </Step>
+  <Step title="Pull the latest changes for your branch">
+    ```bash
+    git pull
+    ```
+
+    This brings in the latest commits from your remote tracking branch.
+  </Step>
+  <Step title="Run sync to update Chromium, patches, and hooks">
+    ```bash
+    pnpm run sync
+    ```
+
+    Without flags, `sync` is smart: if the Chromium version in `package.json` hasn't changed, it only re-applies the patches that changed rather than re-syncing the entire Chromium tree. For most daily updates this takes just a few minutes.
+  </Step>
+  <Step title="Rebuild">
+    ```bash
+    pnpm run build
+    ```
+
+    After a sync that changes Chromium or many patches, `ninja` will recompile only the affected translation units. Builds following a `sync` are usually incremental and much faster than the initial build.
+  </Step>
+</Steps>
+
+## Branch Management Scenarios
+
+### Create a New Feature Branch
+
+```bash
+cd src/brave
+git checkout -b my-feature-branch
+```
+
+No sync is needed after creating a new branch from your current state — you're still on the same Chromium version and patches.
+
+### Checkout an Existing Branch or Tag
+
+When switching to a branch that may have a different Chromium version or different patches, always run `sync` afterwards:
+
+```bash
+cd src/brave
+git fetch origin
+git checkout branch-name          # or: git checkout -b branch-name origin/branch-name
+pnpm run sync
+```
+
+The `sync` output will tell you what changed:
+
+```text
+...Updating 2 patches...
+...Updating child dependencies...
+...Running hooks...
+```
+
+### Pull Latest Changes on an Existing Branch
+
+```bash
+cd src/brave
+git pull
+pnpm run sync
+```
+
+### Reset to Latest brave-core master
+
+Use this when you want a guaranteed clean state — for example, before starting a new feature or after a complex rebase goes wrong. Be aware this **removes all pending changes** in your `brave-core` working directory:
+
+```bash
+cd src/brave
+git checkout master
+git pull
+pnpm run sync --init
+```
+
+The `--init` flag resets everything to the exact versions in `package.json` and forces a longer build on the next compile.
+
+### Quick Patch-Only Resync (No DEPS Changes)
+
+When you know that `DEPS` and the Chromium version haven't changed but `.patch` files have (for example, after rebasing a small feature branch), you can skip the full sync and only re-apply patches:
+
+```bash
+cd src/brave
+git checkout my-feature-branch
+git pull
+pnpm run apply_patches
+```
+
+```text
+...Applying 2 patches...
+```
+
+This is the fastest possible "mini-sync" — it skips all `gclient` activity and just re-runs the patch application step.
+
+## Enabling Google Safe Browsing
+
+If you need Google Safe Browsing to function in your development build, obtain an API key from the [Google Cloud Console](https://console.developers.google.com/) with the SafeBrowsing API enabled, then set the environment variable before building:
+
+```bash
+export GOOGLE_API_KEY="your-api-key-here"
+pnpm run build
+```
+
+See the [Chromium API keys documentation](https://www.chromium.org/developers/how-tos/api-keys) for the full setup.

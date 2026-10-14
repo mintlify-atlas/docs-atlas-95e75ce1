@@ -1,0 +1,246 @@
+---
+title: "Brave Ads: Privacy-Preserving On-Device Ad Targeting"
+sidebarTitle: "Brave Ads"
+description: "Brave Ads performs all ad targeting, catalog matching, and ML classification entirely on-device — no browsing history or personal data ever reaches Brave's servers."
+---
+
+Brave Ads is the privacy-first advertising system built into Brave Core. Unlike conventional ad platforms that profile users on remote servers, Brave Ads keeps all targeting intelligence on the user's device. A locally maintained user model — built from browsing behavior and interest signals — is matched against a downloaded ad catalog entirely within the browser process. No personal data, browsing history, or interest profile is ever transmitted to Brave's servers. Users who opt in to Brave Rewards earn BAT for the ads they view; users who have not joined Rewards can still see ads but do not receive token payouts.
+
+## On-Device Targeting Architecture
+
+The fundamental privacy property of Brave Ads is that **ad selection happens locally**. The flow from catalog download to ad impression involves no real-time server queries about the user.
+
+<Steps>
+
+### Catalog download
+
+The `CatalogResource` component periodically fetches a catalog of available campaigns from Brave's CDN. The catalog encodes all targeting parameters — segments, geographic constraints, day-parting rules, frequency caps, and creative instances — so that the browser can evaluate eligibility locally without further network round-trips.
+
+```cpp
+// Catalog fetch is triggered by the resource component:
+// components/brave_ads/core/internal/catalog/catalog_resource.cc
+// components/brave_ads/core/internal/catalog/catalog_url_request.cc
+```
+
+The catalog URL is constructed with build-channel and environment metadata:
+
+```cpp
+// components/brave_ads/core/internal/catalog/catalog_url_request_builder.cc
+// Request includes staging/production flag from --rewards=staging=true
+```
+
+### User model construction
+
+The `UserModel` is built and maintained entirely on-device from the user's browsing activity. The model classifies page content into interest segments using an ML text-classification pipeline. The resulting behavioral and contextual profiles live only in local storage and are never serialized to a network endpoint.
+
+### Ad eligibility evaluation
+
+When an opportunity to serve an ad arises (a new tab page load, a notification ad slot, or a search result context), the Ads engine evaluates all catalog campaigns against the local user model and applies exclusion rules — frequency caps, recency limits, anti-targeting rules, and conversion suppression — to produce a set of **eligible ads**.
+
+```cpp
+// components/brave_ads/core/public/ads.h
+virtual void MaybeServeNewTabPageAd(
+    MaybeServeNewTabPageAdCallback callback) = 0;
+
+virtual void EvaluateConditionMatcher(
+    const std::string& pref_path,
+    const std::string& condition,
+    std::optional<std::string> test_value,
+    EvaluateConditionMatcherCallback callback) = 0;
+```
+
+### Anonymous confirmation via blinded tokens
+
+When a user views or clicks an ad, the engine redeems a **confirmation token** — a cryptographically blinded token issued by Brave's server — to record the event anonymously. The token confirms that *an* ad was viewed without revealing *who* viewed it.
+
+```cpp
+virtual void TriggerNotificationAdEvent(
+    const std::string& placement_id,
+    mojom::NotificationAdEventType mojom_ad_event_type,
+    ResultCallback callback) = 0;
+
+virtual void TriggerNewTabPageAdEvent(
+    const std::string& placement_id,
+    const std::string& creative_instance_id,
+    mojom::NewTabPageAdMetricType mojom_ad_metric_type,
+    mojom::NewTabPageAdEventType mojom_ad_event_type,
+    ResultCallback callback) = 0;
+```
+
+</Steps>
+
+## Ad Unit Types
+
+Brave Ads delivers three distinct ad unit types, each with dedicated placement logic and event schemas:
+
+<CardGroup cols={3}>
+  <Card title="Notification Ads" icon="bell">
+    Native browser notifications delivered at opportune moments based on user attention signals. Timing is controlled by the user attention model to avoid interrupting active work. Ad creative is fetched from the catalog; no real-time server call occurs at serve time.
+  </Card>
+  <Card title="New Tab Page Ads" icon="image">
+    Branded background images displayed on a user's new tab page (also called **sponsored images**). The catalog entry includes a `condition_matcher` — a set of pref-path/condition pairs that must all evaluate to `true` on-device before the ad is shown.
+  </Card>
+  <Card title="Search Result Ads" icon="magnifying-glass">
+    Ads displayed inline within Brave Search results. Ad selection is performed server-side by the search provider; the browser handles event triggering (view, click, conversion) via `TriggerSearchResultAdEvent`.
+  </Card>
+</CardGroup>
+
+## Targeting Mechanisms
+
+All targeting algorithms run locally. Brave Ads supports three complementary targeting modes:
+
+| Mode | Description | Data location |
+|---|---|---|
+| **Behavioral** | Models the user's interests from browsing history using ML text classification. Segments map to the standard IAB taxonomy. | On-device only |
+| **Contextual** | Matches ad segments to the content of the currently active page, without consulting external context-classification services. | On-device only |
+| **Geographic** | Coarse geolocation derived from system locale and subdivisions. The `subdivision` parameter is fetched from a privacy-respecting regional endpoint but is not associated with user identity. | Subdivision code only |
+
+**Condition matchers** provide fine-grained eligibility control for new tab page ads. They evaluate one or more pref-path + condition pairs with AND logic directly inside the browser:
+
+```cpp
+// Condition types supported:
+//   epoch      — compare pref value as Unix timestamp
+//   numerical  — compare numeric pref value
+//   regex      — match pref value against a regular expression
+//   pattern    — match using glob-style patterns
+//
+// Example: show ad only if user has been active for >= 7 days
+// pref_path: "brave.stats.last_seen_filter_list_update"
+// condition: "epoch:>:1704067200"
+```
+
+## Anonymous Confirmations and BAT Payouts
+
+Ad events generate **confirmation tokens** — blinded tokens issued by Brave's server — that are redeemed to confirm impressions without revealing the user's identity. This is the same Privacy Pass–based pipeline used by Brave Rewards' VOPRF credential system.
+
+The `account/` subsystem manages the full lifecycle:
+
+```
+components/brave_ads/core/internal/account/
+├── account.cc             # Top-level account ledger
+├── confirmations/         # Blinded-token confirmation logic
+├── deposits/              # BAT deposit records
+├── issuers/               # Public keys for token signing
+├── transactions/          # Local ledger of confirmed events
+├── tokens/                # Confirmation token storage
+└── user_rewards/          # User's earned rewards state
+```
+
+A **statement of accounts** — surfaced to the user as their earned BAT summary — is built entirely from the local transaction ledger:
+
+```cpp
+virtual void GetStatementOfAccounts(
+    GetStatementOfAccountsCallback callback) = 0;
+```
+
+## P3A Privacy-Preserving Reporting
+
+Brave Ads feeds aggregated metrics into Brave's **P3A** (Private Product Analytics) pipeline. P3A uses PPOPRF and Shamir Secret Sharing via the STAR protocol to provide k-anonymity: individual user behavior cannot be distinguished from the cohort. Advertisers receive aggregate campaign performance; no per-user event stream is ever produced.
+
+<Note>
+  The P3A integration for Ads is in `components/brave_rewards/content/rewards_p3a.cc`
+  and is controlled by the same privacy-preserving telemetry infrastructure
+  as all other Brave P3A metrics.
+</Note>
+
+## Public API Surface
+
+The `Ads` class in `components/brave_ads/core/public/ads.h` is the single entry point for all external callers (browser process, tests, and the `AdsServiceImpl` integration layer):
+
+```cpp
+// components/brave_ads/core/public/ads.h
+class Ads {
+ public:
+  [[nodiscard]] static std::unique_ptr<Ads> CreateInstance(
+      AdsClient& ads_client,
+      const base::FilePath& database_path);
+
+  virtual void Initialize(mojom::WalletInfoPtr mojom_wallet,
+                          ResultCallback callback) = 0;
+  virtual void Shutdown(ResultCallback callback) = 0;
+
+  // Introspection
+  virtual void GetInternals(GetInternalsCallback callback) = 0;
+  virtual void GetDiagnostics(GetDiagnosticsCallback callback) = 0;
+
+  // Ad serving
+  virtual void MaybeServeNewTabPageAd(
+      MaybeServeNewTabPageAdCallback callback) = 0;
+
+  // Event triggers
+  virtual void TriggerNotificationAdEvent(
+      const std::string& placement_id,
+      mojom::NotificationAdEventType mojom_ad_event_type,
+      ResultCallback callback) = 0;
+
+  // User feedback (toggle-style: calling again returns to neutral)
+  virtual void ToggleLikeAd(mojom::ReactionInfoPtr mojom_reaction,
+                            ResultCallback callback) = 0;
+  virtual void ToggleDislikeAd(mojom::ReactionInfoPtr mojom_reaction,
+                               ResultCallback callback) = 0;
+  virtual void ToggleLikeSegment(mojom::ReactionInfoPtr mojom_reaction,
+                                 ResultCallback callback) = 0;
+  virtual void ToggleSaveAd(mojom::ReactionInfoPtr mojom_reaction,
+                            ResultCallback callback) = 0;
+};
+```
+
+## Component Structure
+
+Brave Ads follows the Chromium layered-components pattern with a strict separation between the content-API-free `core/` layer and the browser-process integration layers:
+
+```
+components/brave_ads/
+├── core/                    # Content-API-independent shared code
+│   ├── public/              # Public API surface (ads.h, callbacks, observer)
+│   │   └── ad_units/        # Per-type public structs (notification, NTP, search)
+│   ├── internal/            # Implementation (not visible to consumers)
+│   │   ├── account/         # Blinded-token confirmations + BAT ledger
+│   │   ├── ad_units/        # Per-type serving logic
+│   │   ├── catalog/         # Catalog download, parsing, and caching
+│   │   ├── targeting/       # Behavioral, contextual, geographic engines
+│   │   └── application_state/
+│   ├── mojom/               # Mojo data structures
+│   └── test/                # Shared test fixtures
+├── content/                 # Content-API integration (web page targeting)
+├── browser/                 # Desktop + Android browser-process layer
+│   └── (transitioning to core/ + content/ over time)
+└── resources/               # ML model files, catalog runtime resources
+```
+
+## Diagnostics and Debugging
+
+<Tabs>
+  <Tab title="Ads Internals">
+    Visit `brave://ads-internals` to inspect the current catalog, active campaigns, user model segments, and confirmation token inventory. The **Ad diagnostics** tab provides a structured view of the engine state.
+  </Tab>
+  <Tab title="Command-Line Flags">
+    ```bash
+    # Force staging environment and enable debug mode (faster catalog refresh)
+    brave --rewards=staging=true,debug=true
+
+    # Verbose per-module logging for Brave Ads
+    brave --vmodule="*/brave_ads/*"=6,"*/bat_ads/*"=6
+    ```
+  </Tab>
+  <Tab title="Rewards Log">
+    Enable diagnostic logging at `brave://flags/#brave-rewards-verbose-logging`.
+    The `Rewards.log` file is stored on the device and viewable on the **Logs**
+    tab at `brave://rewards-internals`.
+  </Tab>
+</Tabs>
+
+## Running Tests
+
+<Tabs>
+  <Tab title="Browser Tests">
+    ```bash
+    pnpm test brave_browser_tests --filter=BraveAds*
+    ```
+  </Tab>
+  <Tab title="Unit Tests">
+    ```bash
+    pnpm test brave_unit_tests --filter=BraveAds*
+    ```
+  </Tab>
+</Tabs>

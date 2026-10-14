@@ -1,0 +1,208 @@
+---
+title: "Brave VPN: Built-In Privacy-Preserving VPN Service"
+sidebarTitle: "Brave VPN"
+description: "Brave VPN integrates a Privacy Pass credential system that decouples payment identity from VPN usage, supporting IKEv2 and WireGuard on desktop and Android."
+---
+
+Brave VPN is a full-device VPN service built into the Brave browser, powered by Guardian's VPN infrastructure. Beyond standard VPN tunneling, Brave VPN's distinguishing architectural property is its **credential system**: when you connect to the VPN, the VPN endpoint learns only that *some* valid subscriber is connecting — not *who* is connecting. Payment identity and service usage are decoupled using a blind token protocol based on Privacy Pass (RFC 9576). The VPN component runs as a `KeyedService` in the browser process and manages both the connection lifecycle and regional server selection.
+
+## How Brave VPN Works
+
+<Steps>
+
+### Subscription and credential issuance
+
+When a user purchases Brave VPN, the browser contacts the Brave Subscription Service (payment.bsg.brave.com) to prove payment. The browser then uses the SKUs SDK to generate random tokens locally, blind them using the VOPRF protocol, and send only the blinded tokens to Brave's Challenge Bypass Server (CBR) for signing. The CBR returns blind signatures and a DLEQ batch proof. The browser verifies the proof and unblinds the tokens — producing anonymous credentials the VPN server can later validate but cannot link back to the original purchase.
+
+### Connection establishment
+
+When the user connects, the browser presents an unblinded credential token as a **subscriber credential**. The VPN endpoint (`connect-api.guardianapp.com`) forwards the token to the CBR for verification. The CBR checks the signature and the double-spend store, then confirms or rejects the credential. No account ID, email, or payment information is included in the credential presentation.
+
+```cpp
+// components/brave_vpn/browser/brave_vpn_service.h (Android interface)
+virtual void GetIKEv2ProfileCredentials(
+    ResponseCallback callback,
+    const std::string& subscriber_credential,
+    const std::string& hostname) = 0;
+
+virtual void GetWireguardProfileCredentials(
+    ResponseCallback callback,
+    const std::string& subscriber_credential,
+    const std::string& public_key,
+    const std::string& hostname) = 0;
+```
+
+### Region selection
+
+`BraveVPNRegionDataManager` fetches the list of available server regions and cities from the Guardian API, caches them locally, and persists the user's preferred region in profile prefs. The region list includes continent, country, and per-city precision:
+
+```cpp
+// components/brave_vpn/browser/connection/brave_vpn_constants.h
+inline constexpr char kVpnHost[] = "connect-api.guardianapp.com";
+inline constexpr char kServerRegionsWithCities[] =
+    "api/v1.3/servers/all-server-regions/";
+inline constexpr char kHostnameForRegionNew[] =
+    "api/v1.3/servers/hostnames-for-region";
+```
+
+### Tunnel protocol negotiation
+
+`BraveVPNConnectionManager` selects the appropriate `ConnectionAPIImpl` — either the **IKEv2** implementation (macOS, Windows) or the **WireGuard** implementation (Windows, macOS, Android) — and manages the OS-level VPN configuration and connection state machine.
+
+</Steps>
+
+## Privacy Pass Credential System
+
+Brave VPN uses the same Privacy Pass (RFC 9576) credential pipeline that powers Brave Leo and Brave Search Premium. The core guarantee is **unlinkability**: the party that issues credentials (the CBR, acting on behalf of the Subscription Service) cannot match a later presented credential to the original signing request.
+
+```
+Payment Provider        Subscription Service     Challenge Bypass Server
+(Stripe/Apple/Google)   (payment.bsg.brave.com)  (blind signer)
+       |                        |                         |
+       | 1. User pays           |                         |
+       |----------------------->|                         |
+       |                        | 2. Order marked "paid"  |
+Browser ──3. Generate tokens────>|                         |
+        ──4. Blind tokens locally                          |
+        ──5. Send blinded tokens──>──6. Forward to CBR────>|
+                                   <──7. Blind sigs + proof|
+Browser <──8. Signed tokens────────|                        |
+        ──9. Verify DLEQ proof                              |
+        ──10. Unblind tokens locally
+
+                        VPN Endpoint
+Browser ──11. Present token + subscriber_credential────────>|
+                        |──12. Forward to CBR for verify────>|
+                        |<──13. Valid (or 409 double-spend)──|
+                        |──14. Grant VPN access─────────────>Browser
+```
+
+### Credential types
+
+| Type | Description |
+|---|---|
+| **TimeLimitedV2** | Production type. Tokens bucketed into time windows with per-window sub-issuer keys. Single-use per window, enforced server-side by the CBR's redemption store. |
+| **SingleUse** | One-time tokens using the same blind signature scheme. |
+| **TimeLimited (v1)** | Legacy. Server-generated HMAC-derived tokens; weaker privacy since the server produces the values directly. |
+
+<Note>
+  The full credential lifecycle — generation, blinding, signing, unblinding, and
+  presentation — is documented in
+  `components/skus/browser/rs/lib/src/sdk/credentials/` (Rust). The VPN
+  credential integration lives at
+  `components/brave_vpn/browser/connection/brave_vpn_region_data_manager.cc`.
+</Note>
+
+## Connection Manager Architecture
+
+`BraveVPNConnectionManager` is the single entry point for all VPN connection operations. It composes two collaborators:
+
+| Collaborator | Class | Responsibility |
+|---|---|---|
+| Region management | `BraveVPNRegionDataManager` | Fetches, caches, and exposes server regions and cities |
+| Connection state | `ConnectionAPIImpl` | Manages OS-level VPN tunnel create/connect/disconnect |
+
+The manager creates the correct `ConnectionAPIImpl` subclass at runtime via a factory callback, allowing seamless switching between IKEv2 (system VPN framework) and WireGuard implementations:
+
+```cpp
+// components/brave_vpn/browser/connection/brave_vpn_connection_manager.h
+class BraveVPNConnectionManager {
+ public:
+  using ConnectionAPIImplGetter =
+      base::RepeatingCallback<std::unique_ptr<ConnectionAPIImpl>(
+          BraveVPNConnectionManager*,
+          scoped_refptr<network::SharedURLLoaderFactory>,
+          bool)>;
+
+  class Observer : public base::CheckedObserver {
+   public:
+    virtual void OnConnectionStateChanged(mojom::ConnectionState state) = 0;
+  };
+};
+```
+
+### Connection protocols
+
+<CardGroup cols={2}>
+  <Card title="IKEv2" icon="server">
+    Implemented in `browser/connection/ikev2/`. Uses the OS-native VPN framework on macOS and Windows to create a system-wide IKEv2 tunnel. Credentials are obtained from the Guardian API using `GetIKEv2ProfileCredentials`.
+  </Card>
+  <Card title="WireGuard" icon="bolt">
+    Implemented in `browser/connection/wireguard/`. Uses the WireGuard kernel module on Windows and macOS, and the Android WireGuard library. Credentials are obtained via `GetWireguardProfileCredentials`, which includes the client's public key.
+  </Card>
+</CardGroup>
+
+## BraveVpnService
+
+`BraveVpnService` (`browser/brave_vpn_service.h`) is the `KeyedService` that browser-level code uses to check VPN state and trigger connection changes. It implements the `mojom::ServiceHandler` Mojo interface and relays state changes to all registered `mojom::ServiceObserver` remotes.
+
+```cpp
+// components/brave_vpn/browser/brave_vpn_service.h
+class BraveVpnService : public mojom::ServiceHandler,
+                        public KeyedService {
+ public:
+  virtual bool IsBraveVPNEnabled() const = 0;
+  virtual bool IsPurchased() const = 0;
+  virtual void ReloadPurchasedState() = 0;
+
+  // Desktop only:
+  virtual bool IsConnected() const = 0;
+  virtual void ToggleConnection() = 0;
+  virtual mojom::ConnectionState GetConnectionState() const = 0;
+  virtual std::string GetLastConnectionError() const = 0;
+};
+```
+
+State transitions are broadcast to observers via `NotifyConnectionStateChanged` and `NotifyPurchasedStateChanged`, keeping the toolbar button and settings page in sync without polling.
+
+## Supported Platforms
+
+| Platform | Protocol | Status |
+|---|---|---|
+| Windows | IKEv2, WireGuard | Available |
+| macOS | IKEv2, WireGuard | Available |
+| Android | WireGuard, IKEv2 | Available |
+| iOS | — | Not yet available |
+| Linux | — | Not yet available |
+
+## Component Structure
+
+```
+components/brave_vpn/
+├── browser/                     # Browser-process KeyedService
+│   ├── brave_vpn_service.h      # Public KeyedService API
+│   ├── brave_vpn_service_impl.cc
+│   ├── brave_vpn_metrics.cc     # P3A usage metrics
+│   └── connection/
+│       ├── brave_vpn_connection_manager.cc   # Central connection orchestrator
+│       ├── brave_vpn_region_data_manager.cc  # Server region list + caching
+│       ├── ikev2/               # IKEv2 OS-level implementation
+│       └── wireguard/           # WireGuard implementation + credentials
+├── common/                      # Shared Mojo interfaces + utilities
+│   ├── brave_vpn_constants.h    # Guardian API endpoints
+│   ├── mojom/brave_vpn.mojom    # All Mojo contracts
+│   └── buildflags/
+├── app/                         # UI layer (settings, toolbar button)
+└── resources/                   # Icons and UI assets
+```
+
+<Warning>
+  Brave VPN requires an active subscription. Calling `ToggleConnection()` on a
+  profile where `IsPurchased()` returns `false` will redirect the user to the
+  purchase flow rather than attempting to connect.
+</Warning>
+
+## Running Tests
+
+<Tabs>
+  <Tab title="Browser Tests">
+    ```bash
+    pnpm test brave_browser_tests --filter=BraveVPN*
+    ```
+  </Tab>
+  <Tab title="Unit Tests">
+    ```bash
+    pnpm test brave_unit_tests --filter=BraveVPN*
+    ```
+  </Tab>
+</Tabs>

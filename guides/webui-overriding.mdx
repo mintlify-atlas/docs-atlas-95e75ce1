@@ -1,0 +1,308 @@
+---
+title: "Overriding Upstream Chromium WebUI Components"
+sidebarTitle: "WebUI Overrides"
+description: "Strategies for modifying Chromium's Lit and Polymer WebUI: chromium_src file overrides, Lit function/property patching, lit-mangler for HTML templates, and adding new build targets."
+---
+
+Brave ships with a number of modified versions of Chromium's built-in browser pages, such as the settings screen, new-tab page, and history view. These pages are built with Chromium's Lit or Polymer frameworks, which means Brave cannot simply swap in a React component — instead, a set of targeted override mechanisms allow surgical modifications without forking entire upstream files.
+
+## Choosing the Right Override Strategy
+
+<CardGroup cols={2}>
+  <Card title="chromium_src override" icon="files">
+    Replaces or wraps an entire upstream file. Best for logic changes, CSS tweaks, and re-exports.
+  </Card>
+  <Card title="Lit function override" icon="code">
+    Adds new methods to an existing Lit element via TypeScript declaration merging and prototype assignment.
+  </Card>
+  <Card title="Lit property override" icon="layer-group">
+    Adds reactive properties to a Lit element by subclassing and re-registering the custom element.
+  </Card>
+  <Card title="Lit Mangler" icon="wand-magic-sparkles">
+    Modifies the HTML template of a Lit element using DOM APIs before the build processes it.
+  </Card>
+</CardGroup>
+
+<Tabs>
+  <Tab title="chromium_src Overrides">
+    ## chromium_src File Overrides
+
+    The simplest and most broadly applicable override mechanism. Create a file at the same relative path under `chromium_src/` and it will replace the upstream version in the build. The original file remains accessible via an auto-generated `-chromium.<ext>` import alias if you need to re-export or wrap upstream functionality.
+
+    <Note>
+    You only need to re-export upstream symbols if your replacement is additive. If you are completely replacing a file, simply omit the re-export.
+    </Note>
+
+    ### TypeScript Example
+
+    ```ts
+    // chromium_src/path/to/file.ts
+
+    import { frob as frobChromium } from './file-chromium.js'
+
+    // Re-export everything from upstream so callers are unaffected
+    export * from './file-chromium.js'
+
+    // In Brave, all frobs are twice as good.
+    export function frob() {
+      return frobChromium() * 2
+    }
+    ```
+
+    ### CSS Example
+
+    CSS overrides require a `#css_wrapper_metadata` block so the build knows the type of CSS being overridden. The `type` value must match the upstream file — `style-lit` for Lit components and `style-polymer` for Polymer.
+
+    ```css
+    /* chromium_src/path/to/file.css */
+
+    /* #css_wrapper_metadata_start
+     * #type=style-lit
+     * #import=./file-chromium.css.js
+     * #scheme=relative
+     * #css_wrapper_metadata_end */
+
+    :host {
+      background: hotpink;
+    }
+    ```
+
+    ### When to Keep Overrides Minimal
+
+    `chromium_src` overrides require a specific approval in code review. To keep those overrides minimal — and avoid requiring approvals for substantial feature work — move the bulk of your changes into a new Brave-owned file and simply invoke it from the thin `chromium_src` shim. See [Adding New Files](#adding-new-files) below.
+  </Tab>
+
+  <Tab title="Lit Functions">
+    ## Adding Functions to Lit Components
+
+    Naively subclassing an upstream Lit element breaks because the HTML template's type system depends on the exact exported class shape. The correct approach is **TypeScript declaration merging** combined with prototype assignment, which extends the element without changing its identity.
+
+    ```ts
+    // chromium_src/path/to/fancy.ts
+
+    import { FancyElement } from './fancy-chromium.js'
+
+    // Extend the type of the upstream class via declaration merging
+    declare module './fancy-chromium.js' {
+      interface FancyElement {
+        isBraveAndFancy: () => boolean
+      }
+    }
+
+    // Assign the implementation at runtime
+    FancyElement.prototype.isBraveAndFancy = () => true
+
+    export * from './fancy-chromium.js'
+    ```
+
+    This works for:
+    - Adding new methods that the template can call as `${this.isBraveAndFancy()}`
+    - Adding helper utilities referenced by Brave-specific template additions via a Lit Mangler
+
+    For a real example, see [brave-core PR #29598](https://github.com/brave/brave-core/pull/29598/files).
+  </Tab>
+
+  <Tab title="Lit Properties">
+    ## Adding Reactive Properties to Lit Components
+
+    Adding a reactive property (one that triggers re-renders when it changes) requires more invasive surgery: you must prevent the upstream `customElements.define` call from running, subclass the element, declare the new property, and re-register under the same tag name.
+
+    ```ts
+    // chromium_src/path/to/fancy.ts
+
+    import { FancyElement as FancyElementChromium } from './fancy-chromium.js'
+
+    // Declaration merge still uses 'FancyElement' so the getHtml
+    // function gets the correct 'this' type.
+    declare module './fancy-chromium.js' {
+      interface FancyElement {
+        isBraveAndFancy: boolean
+      }
+    }
+
+    class FancyElement extends FancyElementChromium {
+      static override get properties() {
+        return {
+          ...super.properties,
+          // Register the new property as reactive
+          isBraveAndFancy: { type: Boolean },
+        }
+      }
+
+      // 'override' is required because the declaration merge placed
+      // this property on the upstream interface.
+      override accessor isBraveAndFancy: boolean = true
+    }
+
+    export { FancyElement }
+    export * from './fancy-chromium.js'
+
+    // Re-register the element. You must also patch out the upstream
+    // customElements.define call so it doesn't conflict.
+    customElements.define(FancyElement.is, FancyElement)
+    ```
+
+    <Warning>
+    The `...super.properties` spread causes Lit to re-create accessors for upstream properties against the subclass prototype. Properties that only ever receive their initializer value — and are never reassigned — will read back `undefined`. Assign those properties explicitly in the subclass constructor to fix this. Redeclaring them as fields breaks type interchangeability.
+    </Warning>
+  </Tab>
+
+  <Tab title="Lit Mangler">
+    ## Modifying Lit HTML Templates
+
+    The strategies above work for logic and properties but cannot modify the HTML template itself. To change what a Lit template renders, use the **lit-mangler** build tool.
+
+    ### Creating a Mangler File
+
+    Create a `.lit_mangler.ts` file next to the `chromium_src` override for the component. The mangler receives the parsed template as a DOM element and can use standard DOM APIs to modify it:
+
+    ```
+    chromium_src/path/to/your/file.html.ts.lit_mangler.ts
+    ```
+
+    For components without a checked-in `.html.ts` (where upstream ships a plain `.html` file processed by `html_to_wrapper`), target the `.html` directly:
+
+    ```
+    chromium_src/path/to/your/file.html.lit_mangler.ts
+    ```
+
+    ### Mangler Example
+
+    ```ts
+    // chromium_src/path/to/your/file.html.ts.lit_mangler.ts
+    import mangle from 'lit-mangler'
+
+    // Replace all occurrences of "Chrome" with "Brave" in the container template
+    mangle(
+      (element) => {
+        const container = element.querySelector('.container')
+        if (!container) throw new Error("Couldn't find .container")
+        container.textContent = container.textContent.replaceAll('Chrome', 'Brave')
+      },
+      // Selector function: pick the template that contains '.container'
+      (literal) => literal.text.includes('class="container"'),
+    )
+    ```
+
+    ### Mangling Multiple Templates
+
+    When a component has nested `html` template literals (e.g., one for the outer shell and one inside a `.map()`), each is mangled independently:
+
+    ```ts
+    import mangle from 'lit-mangler'
+
+    // Modify the outer container template
+    mangle(
+      (e) => {
+        const container = e.querySelector('.container')
+        if (!container) throw new Error("Couldn't find .container")
+        container.classList.add('brave')
+      },
+      (t) => t.text.includes('class="container"'),
+    )
+
+    // Modify the inner list-item template
+    mangle(
+      (e) => {
+        const li = e.querySelector('li')
+        if (!li) throw new Error("Couldn't find li")
+        // Template interpolations must be escaped — they run at browser runtime
+        li.setAttribute('id', '${c.id}')
+        li.innerHTML = `<span>\${c.text}</span>`
+      },
+      (t) => t.text.startsWith('<li'),
+    )
+    ```
+
+    ### Known Mangler Limitations
+
+    <Warning>
+    Two patterns cannot be expressed through DOM APIs and require workarounds:
+
+    - **`?attr` and `@event` bindings** — The `?` and `@` characters are invalid in attribute names. To add these to an element, splice them directly into `outerHTML` using string manipulation.
+    - **camelCase property bindings** — Attribute names are lowercased by the HTML parser. A `.camelCaseProperty` binding only survives round-tripping if that exact spelling already exists elsewhere in the file. Otherwise, render via a method call: `${this.renderThing_()}`.
+
+    Templates with nested `html` literals inside **attribute values** cannot be mangled at all — the nested quotes break the parser. Mangle an inner template instead and use a companion `chromium_src` override for anything remaining.
+    </Warning>
+
+    ### Keeping Manglers Up to Date
+
+    Every mangler automatically generates a snapshot test. Run the following command to create or update the snapshot after writing a new mangler:
+
+    ```sh
+    pnpm run test-unit -t "mangled files should have up to date snapshots" -u
+    ```
+
+    If the snapshot test fails on CI it means upstream changed the template. Inspect the diff, confirm the mangler still applies correctly, then update the snapshot.
+  </Tab>
+
+  <Tab title="Polymer Overrides">
+    ## Modifying Polymer Templates
+
+    Polymer templates are standard HTML `<template>` elements, which makes them significantly easier to manipulate than Lit templates.
+
+    **Option 1 — `chromium_src` override:** Create a `chromium_src` file for the Polymer element's JS and modify the template string directly, re-importing from the `-chromium.js` alias if needed.
+
+    **Option 2 — `polymer_overriding` utilities:** Use the helpers in `//brave/ui/webui/resources/polymer_overriding.ts` to surgically patch template elements at runtime without touching the upstream file at all. This is often the least invasive approach and keeps the diff minimal.
+
+    ```ts
+    import { addWebUIListener } from 'chrome://resources/js/cr.js'
+    import { registerPolymerTemplateModifications } from
+      '//resources/brave/polymer_overriding.js'
+
+    registerPolymerTemplateModifications({
+      // Key is the Polymer element name
+      'settings-ui': (templateContent) => {
+        const toolbar = templateContent.querySelector('cr-toolbar')
+        if (!toolbar) throw new Error("Couldn't find cr-toolbar in settings-ui")
+        toolbar.setAttribute('show-search', 'false')
+      },
+    })
+    ```
+  </Tab>
+
+  <Tab title="Adding New Files">
+    ## Adding New Files to Upstream Builds
+
+    When your changes are more than cosmetic, the best approach is to add a new Brave-owned build target and patch it into the upstream build. This keeps your `chromium_src` override minimal (usually just a one-line import) and puts the bulk of your work in a regular Brave file that does not need `chromium_src` approval.
+
+    Look at `//brave/browser/resources/settings/BUILD.gn` and `//brave/browser/resources/settings/settings.gni` for a working example of how to define a new target and splice it into the upstream build graph.
+
+    ```gn
+    # brave/browser/resources/settings/BUILD.gn (abbreviated)
+    import("//brave/browser/resources/settings/settings.gni")
+
+    brave_settings_sources = [
+      "brave_settings_ui.ts",
+      "brave_privacy_page.ts",
+    ]
+
+    # This target is added to the upstream settings bundle via a sources.gni patch
+    js_library("brave_settings") {
+      sources = brave_settings_sources
+      deps = [ "//brave/components/brave_shields/..." ]
+    }
+    ```
+
+    The companion `.gni` file is then imported by `chromium_src` versions of the upstream `BUILD.gn` files to splice in the Brave sources without replacing the entire upstream build definition.
+  </Tab>
+</Tabs>
+
+## Localized Strings in Override Files
+
+When your override needs translated strings, follow the guidance in [WebUI Strings](./webui-strings) to generate TypeScript enums from `.grdp` string definitions. This avoids hard-coded string keys and provides compile-time checks for typos.
+
+## Summary of Approval Requirements
+
+| Technique | Requires `chromium_src` approval? |
+|-----------|----------------------------------|
+| `chromium_src` file override | Yes |
+| Lit function (prototype) | Yes (file lives in `chromium_src`) |
+| Lit property (subclass + re-register) | Yes (file lives in `chromium_src`) |
+| Lit mangler | Yes (file lives in `chromium_src`) |
+| Polymer `registerPolymerTemplateModifications` | No (Brave-owned file) |
+| New build target + `.gni` patch | Usually no for the Brave target |
+
+<Tip>
+When in doubt, move logic out of `chromium_src` and into a new Brave-owned file. Keep `chromium_src` overrides as thin shims — this reduces the surface area that needs `chromium_src` approval and makes future Chromium upgrades easier.
+</Tip>

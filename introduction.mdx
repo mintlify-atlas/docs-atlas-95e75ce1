@@ -1,0 +1,98 @@
+---
+title: "Brave Core: Open-Source Engine of the Brave Browser"
+sidebarTitle: "Introduction"
+description: "Brave Core is the open-source set of changes, APIs, and scripts that customizes Chromium into the Brave browser, spanning desktop and mobile platforms."
+---
+
+Brave Core is the heart of the Brave browser — an open-source collection of changes, APIs, patch files, and build scripts that transform the Chromium engine into the privacy-first Brave browser. Rather than forking Chromium outright, Brave Core lives as a Git repository mounted at `src/brave` inside a standard Chromium checkout, layering Brave-specific features on top without diverging from upstream in ways that would make rebasing painful.
+
+## What Brave Core Is
+
+The [brave-core repository](https://github.com/brave/brave-core) holds everything needed to build the Brave desktop and mobile browser across all supported platforms. It does not contain the Chromium source itself — instead, it defines which Chromium commit to use (via `package.json`), fetches it through `depot_tools`, applies a curated set of `.patch` files onto Chromium code that cannot be overridden any other way, and then adds Brave-specific components that sit beside (or above) Chromium's own layers.
+
+The project is licensed under the Mozilla Public License 2.0, and issues and releases are tracked in the companion [brave-browser](https://github.com/brave/brave-browser) repository.
+
+## How Brave Core Relates to Chromium
+
+Brave Core uses a **layered override strategy** rather than a monolithic fork:
+
+- **`src/brave/chromium_src/`** — files here shadow upstream Chromium files during compilation, letting Brave alter upstream behaviour without touching Chromium source directly.
+- **`.patch` files** — used only when a `chromium_src` override isn't sufficient; for example, making an upstream method `virtual` so a Brave subclass can override it.
+- **`src/brave/components/`** — new Brave-specific components (Shields, Rewards, Wallet, etc.) that follow the same Chromium component layering rules.
+- **`src/brave/browser/`** — embedder-layer code (analogous to Chromium's `//chrome`) that wires Brave components into the browser process.
+
+Because Brave tracks upstream Chromium closely, the chromium version pinned in `package.json` is updated with each Brave release (the current pin targets Chromium `156.x`).
+
+## Key Integrated Sub-Projects
+
+Brave Core coordinates three main source trees via `package.json` and `src/brave/DEPS`:
+
+| Sub-project | Mount point | Purpose |
+|---|---|---|
+| [Chromium](https://chromium.googlesource.com/chromium/src.git) | `src/` | Base browser engine, fetched via `depot_tools` |
+| [brave-core](https://github.com/brave/brave-core) | `src/brave/` | Brave changes, components, and build tooling |
+| [adblock-rust](https://github.com/brave/adblock-rust) | via FFI | Brave's high-performance adblock engine |
+
+The `adblock-rust` library is linked through the [adblock_rust_ffi](https://github.com/brave/brave-core/tree/master/components/adblock_rust_ffi) component, exposing a C FFI boundary so the Rust crate can be called from Chromium's C++ code.
+
+## Repository Structure
+
+```text
+src/brave/
+├── browser/             # Embedder layer — wires components into the browser
+│   ├── brave_browser_main_parts.cc
+│   ├── brave_rewards/
+│   ├── brave_wallet/
+│   └── ui/
+├── chromium_src/        # Upstream overrides (shadow Chromium files at build time)
+│   ├── chrome/
+│   └── third_party/
+├── components/          # Brave feature components (same layer rules as //components)
+│   ├── brave_shields/
+│   ├── brave_ads/
+│   ├── brave_wallet/
+│   ├── brave_rewards/
+│   ├── brave_vpn/
+│   └── ...
+├── docs/                # Developer documentation and best practices
+│   └── best-practices/
+├── build/               # Build scripts and pnpm commands
+│   └── commands/scripts/
+└── package.json         # Chromium version pin + pnpm scripts
+```
+
+<Note>
+  The `chromium_src/` directory uses the same relative path as the upstream file it overrides. If Chromium has `chrome/browser/ui/browser.h`, Brave's override lives at `src/brave/chromium_src/chrome/browser/ui/browser.h`. The build system automatically prefers the Brave version.
+</Note>
+
+## Notable Feature Components
+
+Brave Core ships dozens of original feature components. A representative sample:
+
+- **`brave_shields`** — the Brave Shields ad and tracker blocking pipeline, including the cosmetic filter engine and the adblock-rust FFI bridge.
+- **`brave_ads`** — Brave's privacy-respecting advertising platform (Brave Ads / BAT Ads).
+- **`brave_rewards`** — the creator-tipping and BAT rewards system.
+- **`brave_wallet`** — multi-chain cryptocurrency wallet (Ethereum, Solana, Filecoin, Bitcoin, and more).
+- **`brave_vpn`** — the Brave VPN client integration.
+- **`brave_news`** — the privacy-preserving news feed.
+- **`speedreader`** — distraction-free reading mode using a Rust-based content extractor.
+- **`tor`** — Private Window with Tor integration.
+- **`ai_chat`** — the Leo AI assistant, running locally or via Brave's inference backend.
+- **`p3a`** — Privacy-Preserving Product Analytics, a differential-privacy telemetry system.
+
+## Start Here
+
+<CardGroup cols={2}>
+  <Card title="Prerequisites" icon="list-check" href="/getting-started/prerequisites">
+    Platform-specific setup guides for Linux, macOS, Windows, Android, and iOS before you clone.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Chromium's layering model, downward-only dependency rules, and how Brave's browser/ and components/ fit in.
+  </Card>
+  <Card title="Patching Overview" icon="file-patch" href="/guides/patching-overview">
+    The ordered strategy for modifying Chromium: subclassing, chromium_src overrides, and .patch files.
+  </Card>
+  <Card title="Brave Shields" icon="shield" href="/features/brave-shields">
+    How the Shields ad-blocking pipeline works, from adblock-rust FFI to cosmetic filtering.
+  </Card>
+</CardGroup>

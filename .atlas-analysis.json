@@ -1,0 +1,182 @@
+{
+  "projectType": "general",
+  "projectName": "Brave Core",
+  "projectDescription": "The core engine and build system for the Brave browser — a privacy-focused, Chromium-based browser for Android, iOS, Linux, macOS, and Windows.",
+  "theme": "aspen",
+  "primaryColor": "#f35434",
+  "lightColor": "#f35434",
+  "darkColor": "#f7a492",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Getting Started",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "introduction",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Build & Setup",
+            "pages": [
+              "getting-started/prerequisites",
+              "getting-started/clone-and-init",
+              "getting-started/build",
+              "getting-started/run-and-update"
+            ]
+          },
+          {
+            "group": "Contributing",
+            "pages": [
+              "contributing/guidelines",
+              "contributing/pull-requests",
+              "contributing/localization"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Development Guides",
+        "groups": [
+          {
+            "group": "Chromium Patching",
+            "pages": [
+              "guides/patching-overview",
+              "guides/chromium-src-overrides",
+              "guides/plaster",
+              "guides/chromium-version-upgrade"
+            ]
+          },
+          {
+            "group": "WebUI Development",
+            "pages": [
+              "guides/webui-frontend",
+              "guides/webui-overriding",
+              "guides/webui-strings",
+              "guides/webui-testing"
+            ]
+          },
+          {
+            "group": "Testing",
+            "pages": [
+              "guides/running-tests",
+              "guides/adapting-chromium-tests"
+            ]
+          },
+          {
+            "group": "Build System",
+            "pages": [
+              "guides/gni-sources",
+              "guides/rust-integration",
+              "guides/siso-customization"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Features & Components",
+        "groups": [
+          {
+            "group": "Privacy & Security",
+            "pages": [
+              "features/brave-shields",
+              "features/cryptography",
+              "features/premium-account-privacy",
+              "features/tor-integration"
+            ]
+          },
+          {
+            "group": "Brave Services",
+            "pages": [
+              "features/brave-rewards",
+              "features/brave-wallet",
+              "features/brave-vpn",
+              "features/brave-ads",
+              "features/ai-chat"
+            ]
+          },
+          {
+            "group": "Platform Features",
+            "pages": [
+              "features/griffin-variations",
+              "features/p3a-analytics",
+              "features/sync",
+              "features/ipfs-web3"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Best Practices",
+        "groups": [
+          {
+            "group": "Architecture",
+            "pages": [
+              "best-practices/architecture",
+              "best-practices/coding-standards",
+              "best-practices/memory-management"
+            ]
+          },
+          {
+            "group": "Platform",
+            "pages": [
+              "best-practices/android",
+              "best-practices/ios",
+              "best-practices/frontend"
+            ]
+          },
+          {
+            "group": "Quality",
+            "pages": [
+              "best-practices/testing",
+              "best-practices/patches",
+              "best-practices/localization"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Chromium-based browser engine with privacy-first modifications for all major platforms",
+    "Brave Shields: ad blocking, tracker blocking, and fingerprinting protection powered by adblock-rust",
+    "Brave Rewards: privacy-preserving user reward system using anonymous credentials (VOPRF/Privacy Pass)",
+    "Brave Wallet: multi-chain cryptocurrency wallet supporting ETH, BTC, SOL, ZEC, FIL, and more",
+    "Brave VPN: built-in VPN with Privacy Pass credential system decoupling payment from usage",
+    "Brave Ads: privacy-preserving advertising system with on-device targeting",
+    "AI Chat (Leo): privacy-preserving LLM integration using OHTTP for secure inference",
+    "Tor integration: built-in Tor private window support",
+    "IPFS support: native decentralized web navigation",
+    "Griffin (Variations): Brave's Finch-compatible feature rollout and experimentation service",
+    "P3A: privacy-preserving product analytics using STAR/PPOPRF cryptography",
+    "Plaster: semantic patching system for maintainable Chromium modifications",
+    "Speedreader: browser-native article reading mode",
+    "Brave Sync: end-to-end encrypted cross-device sync",
+    "Brave News: personalized news feed with privacy-preserving discovery"
+  ],
+  "publicApiSurface": [
+    "pnpm run init [--target_os=android|ios] [--target_arch=arm]",
+    "pnpm run sync [--force] [--init] [--create] [brave_core_ref]",
+    "pnpm run build [Release|Static|Debug]",
+    "pnpm run test [brave_components_unittests|brave_unit_tests|brave_browser_tests|chromium_unit_tests]",
+    "pnpm run test-unit [path filter]",
+    "pnpm run update_patches",
+    "pnpm run apply_patches",
+    "pnpm run format",
+    "pnpm run storybook",
+    "pnpm start [Release|Component|Static|Debug]",
+    "BraveContentBrowserClient (C++ embedder entry point)",
+    "BraveBrowserProcess (browser process singleton)",
+    "BraveShields component API",
+    "BraveRewards service API",
+    "BraveWallet service API",
+    "BraveVpn service API",
+    "BraveAds service API",
+    "P3A service API",
+    "Griffin/Variations seed API",
+    "chromium_src override system",
+    "Plaster YAML patching API"
+  ]
+}

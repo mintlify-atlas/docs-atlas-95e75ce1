@@ -1,0 +1,429 @@
+---
+title: "Frontend Best Practices for Brave WebUI Development"
+sidebarTitle: "Frontend"
+description: "React, TypeScript, and CSS patterns for Brave WebUI: component design, state management, Storybook, Mojo bindings, Leo design tokens, and test hygiene."
+---
+
+Brave's WebUI surfaces are built with React and TypeScript, communicate with the browser via Mojo bindings, and use the Leo/Nala design system for colors and icons. The guidelines below address the most common review findings across component structure, state management, security-sensitive patterns, design token usage, and test correctness. Following them produces UIs that are safe, performant, and easy to maintain across Chromium upgrades.
+
+## Component Architecture
+
+<Accordion title="FE-024 — Prefer functional components over class components">
+
+Write React components as functions, not classes. Functional components with hooks are simpler, easier to test, and compose better. The only valid exception is `React.Component` error boundaries (`componentDidCatch` has no hook equivalent).
+
+```tsx
+// ❌ WRONG - class component
+class UserCard extends React.Component<Props, State> {
+  constructor(props: Props) {
+    super(props)
+    this.state = { isExpanded: false }
+  }
+
+  componentDidMount() {
+    fetchUser(this.props.id).then((user) => this.setState({ user }))
+  }
+
+  render() {
+    return (
+      <div>
+        <span>{this.state.user?.name}</span>
+        <button
+          onClick={() => this.setState({ isExpanded: !this.state.isExpanded })}
+        >
+          Toggle
+        </button>
+      </div>
+    )
+  }
+}
+
+// ✅ CORRECT - functional component with hooks
+function UserCard({ id }: Props) {
+  const [isExpanded, setIsExpanded] = React.useState(false)
+  const [user, setUser] = React.useState<User | undefined>()
+
+  React.useEffect(() => {
+    fetchUser(id).then(setUser)
+  }, [id])
+
+  return (
+    <div>
+      <span>{user?.name}</span>
+      <button onClick={() => setIsExpanded((e) => !e)}>Toggle</button>
+    </div>
+  )
+}
+```
+
+</Accordion>
+
+<Accordion title="FE-007 — Return null from components when no data">
+
+React components should return `null` early when there's no data to render, rather than rendering empty containers.
+
+```tsx
+// ❌ WRONG - renders empty container
+function UserInfo({ user }: Props) {
+  return <div className='user-info'>{user ? user.name : ''}</div>
+}
+
+// ✅ CORRECT - return null when no data
+function UserInfo({ user }: Props) {
+  if (!user) return null
+  return <div className='user-info'>{user.name}</div>
+}
+```
+
+</Accordion>
+
+<Accordion title="FE-003 — Move utility functions to dedicated modules">
+
+Pure utility functions should live in dedicated utility modules (e.g., `utils/conversation_history_utils.ts`), not in React context/state files. Context files should focus on state management, not data transformation logic.
+
+</Accordion>
+
+<Accordion title="FE-004 — Merge similar UI components">
+
+When adding support for a new file type to an upload/attachment UI, merge similar components into a single generic one rather than creating parallel components.
+
+```tsx
+// ❌ WRONG - separate components for each type
+<AttachmentImageItem />
+<AttachmentDocumentItem />
+
+// ✅ CORRECT - single generic component
+<AttachmentUploadItem type={file.type} />
+```
+
+</Accordion>
+
+<Accordion title="FE-021 — Extract inline SwiftUI blocks into named views (iOS equivalent for React)">
+
+When an inline JSX block exceeds a few lines, extract it into a named component or a dedicated file. This improves readability and enables reuse.
+
+</Accordion>
+
+## State Management
+
+<Accordion title="FE-009 — Use partial value updates instead of spread-then-modify">
+
+When updating state objects, prefer partial update functions over spreading the entire object and overriding one field.
+
+```tsx
+// ❌ WRONG - spread then override
+setState({ ...state, isLoading: true })
+
+// ✅ CORRECT - partial update
+setPartialState({ isLoading: true })
+```
+
+</Accordion>
+
+<Accordion title="FE-006 — Avoid unnecessary useMemo for simple property access">
+
+Don't wrap simple property lookups in `useMemo`. Accessing `array.length`, `obj.property`, or other trivial derivations is cheaper than React's memoization overhead.
+
+```tsx
+// ❌ WRONG - useMemo for trivial access
+const count = useMemo(() => items.length, [items])
+
+// ✅ CORRECT - direct access
+const count = items.length
+```
+
+</Accordion>
+
+<Accordion title="FE-029 — Clean up async operations in useEffect">
+
+Async operations started in `useEffect` must be properly cleaned up to prevent state updates on unmounted components.
+
+```tsx
+// ❌ WRONG - no cleanup, state update on unmounted component
+useEffect(() => {
+  fetchData().then(setData)
+}, [])
+
+// ✅ CORRECT - AbortController cleanup
+useEffect(() => {
+  const controller = new AbortController()
+  fetchData({ signal: controller.signal }).then(setData)
+  return () => controller.abort()
+}, [])
+```
+
+</Accordion>
+
+<Accordion title="FE-030 — Wrap JSON.parse in try/catch in React render paths">
+
+`JSON.parse` calls on external or server data in React render paths (including `useMemo`) must be wrapped in `try/catch`. Malformed JSON will throw a `SyntaxError` that crashes the entire component tree if uncaught.
+
+```tsx
+// ❌ WRONG - crashes component on malformed JSON
+const config = useMemo(() => JSON.parse(rawData), [rawData])
+
+// ✅ CORRECT - graceful fallback
+const config = useMemo(() => {
+  try {
+    return JSON.parse(rawData)
+  } catch {
+    return defaultConfig
+  }
+}, [rawData])
+```
+
+</Accordion>
+
+## Mojo Bindings & WebUI
+
+<Accordion title="FE-008 — Use generateReactContext for Mojo API contexts">
+
+Use the `generateReactContext` helper from `$web-common/api/react_api` for creating React context + provider pairs for Mojo API bindings. Don't write custom context boilerplate for each API.
+
+</Accordion>
+
+<Accordion title="FE-005 — Don't redefine types from generated bindings">
+
+In TypeScript tests, import enum types from generated Mojo bindings or source files. Do not redefine or duplicate them in test files.
+
+```tsx
+// ❌ WRONG - redefining enum from mojom
+enum FileType {
+  kImage = 0,
+  kDocument = 1,
+}
+
+// ✅ CORRECT - import from generated bindings
+import { FileType } from 'gen/brave/components/ai_chat/core/common/mojom/ai_chat.mojom-webui.js'
+```
+
+</Accordion>
+
+<Accordion title="FE-013 — TS Mojom bindings generate interfaces, not classes">
+
+TypeScript WebUI mojom bindings generate interfaces, not classes. This means `instanceof` checks won't work on mojom types. Use type guards or discriminated unions instead.
+
+```tsx
+// ❌ WRONG - instanceof on mojom-generated type
+if (value instanceof mojom.ConversationTurn) { ... }
+
+// ✅ CORRECT - type guard or property check
+if ('text' in value && 'role' in value) { ... }
+```
+
+</Accordion>
+
+<Accordion title="FE-023 — Use TypeScript entry points instead of inline scripts">
+
+When adding JavaScript to WebUI pages, always use compiled TypeScript entry points rather than inline `<script>` tags. Add additional entry points to the GN build configuration.
+
+```gn
+# ✅ CORRECT - additional entry point in GN
+entry_points = [
+  ["main", rebase_path("main.ts")],
+  ["patches", rebase_path("patches.ts")],
+]
+```
+
+</Accordion>
+
+<Accordion title="FE-014 — WebUI resource files must be in correct top-level directory">
+
+WebUI resource files must be placed in the correct top-level directory under `resources/` matching the WebUI host name. Misplaced resources won't be found at runtime.
+
+</Accordion>
+
+## Leo Design System & CSS
+
+<Accordion title="FE-010 — Don't provide defaults for Leo CSS variables">
+
+Never provide fallback/default values for Leo design system CSS custom properties. Leo variables are guaranteed to be set by the design system; providing defaults can mask theming bugs and produce inconsistent styling.
+
+```css
+/* ❌ WRONG - default masks theming bugs */
+color: var(--leo-color-text-primary, #000);
+
+/* ✅ CORRECT - trust the design system */
+color: var(--leo-color-text-primary);
+```
+
+</Accordion>
+
+<Accordion title="FE-026 — Don't replace hardcoded initial CSS with design tokens that load asynchronously">
+
+In WebUI HTML files, keep hardcoded initial background/foreground colors for the page body or root container. Design tokens like `var(--leo-color-container-background)` are loaded asynchronously via JavaScript — replacing the hardcoded value causes a visible flash of unstyled content (FOUC).
+
+```html
+<!-- ❌ WRONG - Nala token isn't available yet at initial paint -->
+<style>
+  body {
+    background: var(--leo-color-container-background);
+  }
+</style>
+
+<!-- ✅ CORRECT - hardcoded value matches the token's resolved value, avoids FOUC -->
+<style>
+  body {
+    background: #111114;
+  }
+</style>
+```
+
+</Accordion>
+
+## Security Patterns
+
+<Accordion title="FE-001 — Don't spread args in render helpers or components">
+
+Avoid spreading `...args` into `render()`, component props, or other React APIs. Spreading arbitrary arguments can allow unexpected attributes to be injected, potentially leading to XSS.
+
+```tsx
+// ❌ WRONG - spreading arbitrary args
+async function renderMyComponent(
+  ...args: Parameters<typeof render>
+): Promise<ReturnType<typeof render>> {
+  let result: ReturnType<typeof render>
+  await act(async () => {
+    result = render(...args)
+  })
+  return result!
+}
+
+// ✅ CORRECT - explicit props
+async function renderMyComponent(
+  ui: React.ReactElement,
+  options?: RenderOptions,
+): Promise<RenderResult> {
+  let result: RenderResult
+  await act(async () => {
+    result = render(ui, options)
+  })
+  return result!
+}
+```
+
+</Accordion>
+
+<Accordion title="FE-028 — Avoid dangerouslySetInnerHTML for external content">
+
+Do not use `dangerouslySetInnerHTML` to render HTML from external or untrusted sources. Instead, parse the data and render known safe elements using React components. If raw HTML rendering is unavoidable, sanitize it first and request a security review.
+
+</Accordion>
+
+<Accordion title="FE-015 — Prefer semantic HTML links over button+JS navigation">
+
+When a UI element's only action is navigating to a URL, use a proper `<a>` link element instead of a `<button>` with JavaScript navigation.
+
+**Exception:** When a design system (e.g., Leo) provides styled button or link components, prefer those for visual consistency.
+
+```tsx
+// ❌ WRONG - button with JS navigation
+<button onClick={() => window.open(url)}>Visit</button>
+
+// ✅ CORRECT - semantic link
+<a href={url} target="_blank" rel="noopener">Visit</a>
+```
+
+</Accordion>
+
+## JavaScript Footguns
+
+<Accordion title="FE-025 — Beware ||= short-circuit when replacing |=">
+
+Never replace `|=` with `||=` when the right-hand side has side effects. The `||=` operator short-circuits: once the left side is truthy, the right side is never evaluated.
+
+```typescript
+// ❌ WRONG - fn() won't be called once isDirty is true
+isDirty ||= updateFileTimestamps(file)
+
+// ❌ ALSO WRONG
+isDirty = isDirty || updateFileTimestamps(file)
+
+// ✅ CORRECT - function always executes, result accumulated
+isDirty = updateFileTimestamps(file) || isDirty
+```
+
+Place the side-effecting call on the **LEFT** side of `||` to guarantee it always runs.
+
+</Accordion>
+
+<Accordion title="FE-002 — Avoid redundant React keys">
+
+When a parent component already assigns a `key` prop to a child in a list, the child should not redundantly set its own key on inner elements.
+
+```tsx
+// ❌ WRONG - parent already provides key
+{items.map((item) => (
+  <AttachmentItem key={item.id}>
+    <div key={item.id}>{item.name}</div> {/* Redundant! */}
+  </AttachmentItem>
+))}
+
+// ✅ CORRECT - key only on the list element
+{items.map((item) => (
+  <AttachmentItem key={item.id}>
+    <div>{item.name}</div>
+  </AttachmentItem>
+))}
+```
+
+</Accordion>
+
+## Testing
+
+<Tip>
+  New UI components must have Storybook stories covering their primary visual states. Stories serve as both documentation and visual regression baselines. A single integrated story that exercises multiple closely-coupled components together is sufficient.
+</Tip>
+
+<Accordion title="FE-016 — Avoid unnecessary waitFor in React tests">
+
+In React component tests, if you are using `rerender` to trigger updates, `waitFor` should not be needed since `rerender` is synchronous. Using `waitFor` unnecessarily makes tests slower and can mask timing-related bugs.
+
+</Accordion>
+
+<Accordion title="FE-027 — Don't use render().toBeTruthy() in React tests">
+
+`render()` always returns a truthy object, so `expect(render(<Component />)).toBeTruthy()` always passes. Assert on actual rendered content instead.
+
+```tsx
+// ❌ WRONG - always passes, tests nothing
+expect(render(<MyComponent />)).toBeTruthy()
+
+// ✅ CORRECT - verify actual content
+const { getByText } = render(<MyComponent />)
+expect(getByText('Expected text')).toBeTruthy()
+```
+
+</Accordion>
+
+<Accordion title="FE-017 — Avoid global state assumptions for component-scoped operations">
+
+When a function accesses global state (like `window.getSelection()`), consider what happens if multiple instances of the component exist on the page. If the function is component-scoped, pass a ref to the specific component instance instead.
+
+</Accordion>
+
+## Documentation Quality
+
+<Accordion title="FE-018 — Document exported TypeScript types">
+
+Exported TypeScript types intended for use outside the component must have documentation comments explaining their purpose. Complex union types and data shapes used as component APIs especially need explicit documentation.
+
+</Accordion>
+
+<Accordion title="FE-022 — Documentation code examples must be valid">
+
+Code examples in README files and documentation must be syntactically valid and compilable.
+
+```tsx
+// ❌ WRONG - invokes immediately, missing fragment wrapper
+<div>Hello</div>
+<button onClick={api.reset()}>Reset</button>
+
+// ✅ CORRECT - arrow function handler, fragment wrapper
+<>
+  <div>Hello</div>
+  <button onClick={() => api.reset()}>Reset</button>
+</>
+```
+
+</Accordion>

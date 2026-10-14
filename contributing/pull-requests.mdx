@@ -1,0 +1,136 @@
+---
+title: "Submitting Pull Requests to Brave Core"
+sidebarTitle: "Pull Requests"
+description: "Everything required to submit an accepted pull request to Brave Core: checklist items, manual testing evidence, AI policy, and the step-by-step submission workflow."
+---
+
+Pull requests are the primary mechanism for landing code into Brave Core, and the bar for acceptance is deliberately high. Brave is a privacy-focused browser used by millions of people across multiple platforms, and every merged change affects real users. This guide walks through the complete PR submission workflow, what each PR must contain, and the policies contributors are expected to follow around testing, pace, and AI-assisted code.
+
+## PR Submission Workflow
+
+<Steps>
+  <Step title="Ensure your branch is ready">
+    Confirm that your work is on a dedicated feature or fix branch — not on `master`. Squash any WIP commits with `git rebase -i` so the history is clean and logical.
+
+    ```bash
+    cd src/brave
+    git rebase -i origin/master
+    ```
+  </Step>
+  <Step title="Run the full test suite">
+    Run all relevant tests locally and make sure they pass before opening the PR. Do not rely on CI to catch failures you could have caught yourself.
+
+    ```bash
+    # C++ unit tests and browser tests
+    pnpm run test brave_unit_tests
+    pnpm run test brave_browser_tests
+
+    # JavaScript unit tests (from src/brave directory)
+    pnpm run test-unit
+    ```
+  </Step>
+  <Step title="Perform manual testing on all affected platforms">
+    Automated tests do not cover everything. You must manually verify your change works correctly on every platform it affects — desktop (Windows, macOS, Linux), Android, or iOS as appropriate. Capture evidence: write down the steps you followed, take screenshots for any UI changes, and note which platform(s) you tested on.
+  </Step>
+  <Step title="Write a descriptive PR title">
+    The PR title flows directly into the release notes for [desktop](https://github.com/brave/brave-browser/blob/master/CHANGELOG_DESKTOP.md), [Android](https://github.com/brave/brave-browser/blob/master/CHANGELOG_ANDROID.md), and [iOS](https://github.com/brave/brave-browser/blob/master/CHANGELOG_iOS.md). Write it as a user-facing summary of what changed, not as an internal implementation note.
+  </Step>
+  <Step title="Complete the PR description">
+    Fill in every required section of the PR template. See the checklist below for exactly what must be present.
+  </Step>
+  <Step title="Tag reviewers and add labels">
+    Once the PR is open, tag the appropriate reviewers and apply any relevant labels. If you don't have GitHub permissions to do so, a Brave team member will handle it for you.
+  </Step>
+</Steps>
+
+## PR Requirements Checklist
+
+Every pull request submitted to Brave Core must include the following. Missing items are the most common reason PRs are closed without review.
+
+<AccordionGroup>
+  <Accordion title="Descriptive title">
+    The title should clearly describe the user-visible or developer-visible change in plain language. It will appear verbatim in changelogs. Avoid titles like "Fix bug" or "Update code" — prefer "Fix fullscreen video controls disappearing on Windows 11" or "Add unit tests for Rewards panel state machine".
+  </Accordion>
+  <Accordion title="Short summary of changes">
+    A brief paragraph in the description body explaining *what* changed and *why*. This helps reviewers understand the intent before reading the diff, and helps future contributors understand why the change was made when they read the git history.
+  </Accordion>
+  <Accordion title="Reference to the issue being fixed">
+    Every PR must reference the GitHub issue it resolves. Use GitHub's auto-closing syntax in the commit message or PR description so the issue is automatically closed when the PR merges.
+
+    ```
+    Fix https://github.com/brave/brave-browser/issues/1234
+    ```
+
+    Acceptable variants include `Closes #1234`, `Fixes #1234`, and `Resolves #1234`.
+  </Accordion>
+  <Accordion title="Steps to test the fix">
+    Provide numbered, reproducible steps that a reviewer can follow to verify the change works. Include the starting state, the actions to take, and the expected result at each step.
+  </Accordion>
+  <Accordion title="Evidence of manual testing">
+    List the platform(s) you tested on (e.g., "macOS 14 Component build, Windows 11 Release build") and describe what you did. For UI changes, include before/after screenshots directly in the PR description — not as inline code comments.
+  </Accordion>
+  <Accordion title="Screenshots for UI or design changes">
+    If your change affects any visible UI element — layout, color, typography, icons, dialog flow — attach screenshots showing the rendered result. If a design mock-up was provided, include both the mock-up and a screenshot showing your implementation matches it.
+  </Accordion>
+  <Accordion title="New or updated tests">
+    New features and most bug fixes require a new test. The test should cover the logic path introduced or changed by your PR. Exceptions include: changes to areas of code that have no test infrastructure, pure text or config changes, or changes that cannot be exercised by the current test suite — these exceptions should be noted explicitly in the PR description.
+  </Accordion>
+</AccordionGroup>
+
+## Contribution Pace and Volume
+
+<Warning>
+  Do not open large numbers of pull requests in a short period of time. Each PR requires maintainer time to triage, review, and test. Bulk submissions overwhelm limited staff and **may result in all of your PRs being closed without review**.
+</Warning>
+
+New contributors should start with **one or two pull requests**, wait for them to be reviewed and merged, and scale up gradually over time. This approach helps you:
+
+- Learn the codebase conventions and team preferences firsthand.
+- Build trust with reviewers before submitting more complex changes.
+- Avoid repeating the same mistake across many PRs simultaneously.
+
+Each pull request should also address **a single concern**. If your changes fix multiple issues, break them into separate PRs. Smaller, more focused PRs are significantly easier to review and are much less likely to introduce regressions.
+
+## AI-Assisted Contribution Policy
+
+<Note>
+  AI coding tools (GitHub Copilot, Claude, ChatGPT, and similar) are permitted, but the **human contributor is fully and solely responsible** for every PR submitted — regardless of whether AI was involved in producing it.
+
+  Requirements when using AI assistance:
+  - **Understand every change you propose.** Do not relay AI output you cannot explain.
+  - **Build and test everything manually** on the relevant platform(s) before opening the PR, exactly as you would for any hand-written change.
+  - **Do not add AI-generated bot reviewers** to your PRs. All code reviews are done by Brave maintainers.
+  - **Disclose significant AI involvement** when it played a major role in identifying the issue or generating the fix.
+
+  AI tools do not reduce the expected quality bar or testing requirements. The review burden still falls on Brave's team — submitting AI-generated PRs that haven't been properly understood and tested will result in them being closed.
+</Note>
+
+## Closing Issues
+
+Once your PR is merged, the associated issue should be marked with the appropriate milestone reflecting the Nightly (master) build in which the fix landed.
+
+- If the fix needs to be **uplifted** to Dev, Beta, or Release channels, refer to the [uplifting guide](https://github.com/brave/brave-browser/wiki/Uplifting-a-pull-request).
+- If an issue is closed **without a fix** (duplicate, invalid, or not reproducible), remove any milestone markers that may have been added.
+- If a bug **resurfaces** after its issue has been closed, open a **new issue** rather than re-opening the old one — unless the original fix was explicitly reverted.
+
+## Triage Help
+
+Helping with issue triage is one of the most valuable ways to contribute alongside code. Even without write permissions, you can make a significant impact by:
+
+- Asking for reproduction steps or screenshots in issues that lack them.
+- Testing reported bugs and leaving a "Could not reproduce" comment with your environment details.
+- Identifying and cross-linking duplicate issues.
+- Flagging issues that are unclear, mislabelled, or have stale milestones.
+- Testing open pull requests and reporting results.
+
+<Tip>
+  If you contribute consistently to triage, you can be granted write permissions by reaching out to a Brave team member such as [@bbondy](https://github.com/bbondy), [@bsclifton](https://github.com/bsclifton), or [@kjozwiak](https://github.com/kjozwiak).
+</Tip>
+
+## Employee-Specific Requirements
+
+Brave employees submitting PRs must additionally:
+
+- Assign themselves using the **Assignees** field.
+- Tag at least one other employee or contributor using the **Reviewers** field.
+- Work through the PR template checklist and check all applicable boxes before requesting review.

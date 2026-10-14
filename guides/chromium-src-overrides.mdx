@@ -1,0 +1,253 @@
+---
+title: "Using chromium_src Overrides to Modify Upstream Chromium"
+sidebarTitle: "chromium_src"
+description: "The chromium_src directory intercepts Chromium compilation at the file level, letting you replace, wrap, or extend any upstream header or source without a patch file."
+---
+
+The `chromium_src` override system is the primary mechanism Brave Core uses to modify upstream Chromium behavior. Files placed in `src/brave/chromium_src/` are prioritized over their counterparts in the Chromium source tree during compilation, allowing targeted replacements, subclass injections, function wraps, and interface extensions — all without generating `.patch` files. This page explains how each override pattern works and when to reach for each one.
+
+## How the Override System Works
+
+The build system resolves include and compilation paths by checking `src/brave/chromium_src/` first:
+
+- An `#include "chrome/browser/profiles/profile.h"` in any translation unit will resolve to `src/brave/chromium_src/chrome/browser/profiles/profile.h` if that file exists.
+- Compiling the target for `chrome/browser/profiles/profile.cc` will compile `src/brave/chromium_src/chrome/browser/profiles/profile.cc` instead.
+
+No `BUILD.gn` changes are needed to activate this mechanism. The override file simply shadows the upstream file at the same relative path.
+
+<Warning>
+  Never copy an entire upstream file into `chromium_src` and modify a few lines. This leads to silently stale code on every subsequent Chromium rebase. Only override the specific symbol that needs changing and fall back to the upstream implementation for everything else.
+</Warning>
+
+## Subclassing and Overriding
+
+The most maintainable way to change upstream logic is to subclass the Chromium class and override only the methods that need to differ. This requires a small number of trivial structural changes to the upstream header, which can be delivered as a `chromium_src` header override using preprocessor `#define` blocks.
+
+The define should always be placed as the last entry in `public:` so the contents can switch visibility:
+
+```cpp
+// Upstream: chrome/browser/ui/browser.h (excerpt)
+  bool ShouldRunUnloadListenerBeforeClosing(content::WebContents* web_contents);
+  bool RunUnloadListenerBeforeClosing(content::WebContents* web_contents);
+  void SetIsInTabDragging(bool is_in_tab_dragging);
+
+  BRAVE_BROWSER_H
+ private:
+```
+
+```cpp
+// src/brave/chromium_src/chrome/browser/ui/browser.h
+#ifndef BRAVE_CHROMIUM_SRC_CHROME_BROWSER_UI_BROWSER_H_
+#define BRAVE_CHROMIUM_SRC_CHROME_BROWSER_UI_BROWSER_H_
+
+#define BRAVE_BROWSER_H \
+ private:               \
+  friend class BookmarkPrefsService;
+
+#include <chrome/browser/ui/browser.h>
+
+#undef BRAVE_BROWSER_H
+
+#endif  // BRAVE_CHROMIUM_SRC_CHROME_BROWSER_UI_BROWSER_H_
+```
+
+The pattern is: define the macro to inject the extra members, re-include the original header, then `#undef` the macro. Always include the original path (not the `brave/chromium_src/...` path) inside the override.
+
+<Note>
+  Never use `#include "brave/chromium_src/..."` — always reference the original upstream path. The build system routes it to the override automatically.
+</Note>
+
+## Wrapping Upstream Implementations with Defines
+
+When you want to keep the upstream implementation and add Brave logic on top of it, rename the upstream function with the preprocessor and provide a new wrapper implementation that calls the renamed original.
+
+### Making Methods Virtual
+
+For pointer return types:
+
+```cpp
+#define GetExtensionAction           \
+  UnusedMethod() { return nullptr; } \
+  virtual ExtensionAction* GetExtensionAction
+```
+
+For non-pointer return types:
+
+```cpp
+#define ReportResult virtual ReportResult
+```
+
+<Tip>
+  Prefer the `make_virtual` Plaster rewriter over raw `#define` tricks for making methods virtual. The rewriter handles pointer and reference return types, destructors, and avoids the viral side effects of preprocessor macros. See the [Plaster guide](/guides/plaster).
+</Tip>
+
+### Forward-Declaring Brave Hooks to Avoid GN Dependency Creep
+
+`chromium_src` overrides should not `#include` Brave implementation headers directly — doing so creates upstream → Brave dependency edges in the build graph. Instead, forward-declare a free Brave function in the override and implement it in a separate Brave source file:
+
+```cpp
+// chromium_src/chrome/browser/chrome_feature/chrome_feature.cc
+bool BraveDoSomething(...);
+
+#define DoSomething DoSomething_ChromiumImpl
+
+bool ChromeFeature::DoSomething(...) {
+  if (BraveDoSomething(...)) {
+    return true;
+  }
+
+  return DoSomething_ChromiumImpl(...);
+}
+```
+
+```cpp
+// brave/browser/some_feature/my_feature_override.cc
+bool BraveDoSomething(...) {
+  // ...
+}
+```
+
+```gn
+# brave/browser/sources.gni
+deps += [ "//brave/browser/chrome_feature" ]
+```
+
+The upstream target stays clean; the Brave target owns its own includes and deps.
+
+## Replacing a .cc File Completely
+
+Providing a full replacement in `chromium_src` is acceptable in a narrow set of cases — primarily when disabling a Google-specific service or replacing a class with a no-op stub for privacy reasons:
+
+```cpp
+// chromium_src/components/translate/core/browser/translate_url_fetcher.h
+class TranslateURLFetcher {
+ public:
+  TranslateURLFetcher() = default;
+  bool Request(const GURL& url, Callback callback) { return false; }
+};
+```
+
+This avoids two `.patch` files (header + source) while making the intent — "this is entirely replaced" — explicit. Do not use this pattern simply to avoid a small change; reserve it for genuine feature elimination.
+
+## Overriding .gn / .gni Build Files
+
+Build files require special care because GN's evaluation model differs from C++.
+
+- **Never add multiple deps to the same upstream target in different patches.** Instead, create a single Brave dep target and add all other deps inside that target using `public_deps` if needed.
+- **Add sources via a variable**, not inline: `sources += my_brave_sources`, where `my_brave_sources` is defined in a Brave `.gni` file.
+- **Prefer `brave_build.gni`** — it is already imported into nearly every Chromium `.gn` file through a patch in `chrome_build.gni`. Add new `.gni` imports inside `brave_build.gni` rather than patching them into individual `.gn` files.
+
+```gn
+# brave/build/config/brave_build.gni (already imported everywhere)
+import("//brave/components/my_feature/my_feature.gni")
+```
+
+## Patching Mojom Files
+
+Mojom interface definition files can be extended through `chromium_src` overrides. Place the override at the same relative path. Two attributes control the behavior:
+
+| Attribute | Supported types | Purpose |
+|-----------|----------------|---------|
+| `[BraveAdd]` | `const`, `enum`, `interface`, `struct`, `union` | Introduce a new definition; fails if upstream already has one with the same name |
+| `[BraveExtend]` | `enum`, `interface`, `struct`, `union` | Augment an existing definition; fails if the named type does not already exist |
+
+```mojom
+[BraveExtend]
+enum GlobalEnum {
+  NEW_VALUE = 1,
+  NEW_VALUE_GLOBAL_CONSTANT = kGlobalConstant2,
+};
+
+[BraveAdd]
+union NewGlobalUnion {
+  int32 int32_value;
+  float float_value;
+};
+```
+
+## TypeScript and JavaScript Overrides
+
+TypeScript/JavaScript overrides follow the same `chromium_src` shadowing pattern. Add a file at the same path as the upstream module. Import the upstream using the special `-chromium.js` suffix alias, then selectively re-export what you keep and replace what you change:
+
+```ts
+// chromium_src/some/path/foo.ts
+import { getName as getNameChromium, getGreeting } from './foo-chromium.js'
+
+// Everything from upstream will be exported
+export * from './foo-chromium.js'
+
+// Replaces the Chromium version
+export function getName() {
+  return `Brave`
+}
+
+// Export markdown string crossing out the old name
+export function getGreeting() {
+  return `Hi ~~${getNameChromium()}~~ ${getName()}`
+}
+```
+
+For component overrides, the UI framework matters:
+
+- `//resources/brave/lit_overriding.js` — utilities for Lit-based components
+- `//resources/brave/polymer_overriding.js` — utilities for Polymer-based components
+
+### Accessing Private Methods in TypeScript
+
+Because the `private` keyword only exists at compile time in TypeScript, private methods are accessible at runtime via an `as any` cast:
+
+```ts
+const classWeNeedInternalsFrom = new UpstreamClass()
+;(classWeNeedInternalsFrom as any).callPrivateMethod()
+```
+
+This does not work for JavaScript native private fields (prefixed with `#`), which require a more custom approach.
+
+## Python Script Overrides
+
+Python build scripts use `brave_chromium_utils.inline_chromium_src_override()` to inject a `chromium_src` file. Functions, methods, and variables in the inlined file replace their upstream counterparts via `override_utils` helpers, which raise an error if the target symbol no longer exists:
+
+```python
+# Upstream file (at the end, or just before __main__)
+from brave_chromium_utils import inline_chromium_src_override
+inline_chromium_src_override(globals(), locals())
+```
+
+```python
+# brave/chromium_src/path/to/script.py
+@override_utils.override_function(globals())
+def DirectoryIsPartOfPublicGitRepository(orig_func, local_dir):
+    if IsGitIgnored(local_dir, '.'):
+        return False
+    return orig_func(local_dir)
+```
+
+## Best-Practice Summary
+
+<CardGroup cols={2}>
+
+<Card title="✅ Wrap, don't copy" icon="check">
+  Override only the changed section and call `ChromiumImpl` for everything else. Copying whole functions or files leads to stale code on rebase.
+</Card>
+
+<Card title="✅ Forward-declare hooks" icon="check">
+  Forward-declare Brave free functions in the override; implement them in a separate Brave source file. Keep the upstream target's dep graph clean.
+</Card>
+
+<Card title="✅ Use original include paths" icon="check">
+  Always `#include "path/to/original.h"`, never `#include "brave/chromium_src/path/to/original.h"` — the build system handles the redirect.
+</Card>
+
+<Card title="❌ Don't define `final`" icon="xmark">
+  Redefining `final` via `#define` is undefined behavior per the C++ standard and has viral side effects across all translation units. Use a patch or the `drop_final` Plaster rewriter instead.
+</Card>
+
+<Card title="❌ Don't disable tests with #define" icon="xmark">
+  Never use `#define TestName DISABLED_TestName` to skip upstream tests. Use filter files in `test/filters/` and move Brave-specific tests into the appropriate Brave test target.
+</Card>
+
+<Card title="✅ Add explanation comments" icon="check">
+  Include a comment in each override explaining why it exists. The purpose is rarely self-evident from the code alone, especially when the override is read months later during a rebase conflict.
+</Card>
+
+</CardGroup>

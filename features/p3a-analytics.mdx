@@ -1,0 +1,183 @@
+---
+title: "P3A: Privacy-Preserving Product Analytics with STAR"
+sidebarTitle: "P3A Analytics"
+description: "P3A uses the STAR protocol — PPOPRF and Shamir Secret Sharing — to deliver k-anonymous product metrics without ever identifying individual Brave users."
+---
+
+P3A (Privacy-Preserving Product Analytics) is Brave's framework for collecting aggregate product usage metrics while providing strong mathematical privacy guarantees to individual users. Unlike conventional analytics that send raw events to a server, P3A uses the **STAR** (Distributed Secret Sharing for Private Analytics and Reporting) protocol to ensure that Brave's servers can only recover a metric value if it is shared by at least *k* users — preventing any single user's answer from being attributed back to them. The entire system is open source and auditable.
+
+## The STAR Protocol
+
+STAR is built on two cryptographic primitives that work in concert.
+
+<CardGroup cols={2}>
+  <Card title="PPOPRF" icon="key">
+    A **Puncturable Partially Oblivious Pseudorandom Function** allows a client to obtain a pseudorandom value tied to its measurement without the server learning what was measured. The server can later "puncture" specific points to prevent replay.
+  </Card>
+  <Card title="Shamir Secret Sharing" icon="lock">
+    The client's metric value is split into *k* shares. Brave's aggregation servers can only reconstruct the value once they collect *k* matching shares, enforcing the k-anonymity threshold.
+  </Card>
+</CardGroup>
+
+The combination — implemented in the [`sta-rs`](https://github.com/brave/sta-rs) Rust library and wrapped in `components/p3a/constellation/` — means:
+
+1. A client computes a randomness point derived from its metric value and channel metadata.
+2. The STAR randomness server returns a blinded server contribution without learning the plaintext value.
+3. The client assembles a Constellation measurement and submits it encrypted.
+4. The aggregation server only decrypts when it has accumulated *k* matching ciphertexts.
+
+<Note>
+The default k-anonymity threshold for typical metrics is **50** (`kConstellationDefaultThreshold`). Nebula metrics — used for differential-privacy-enhanced analyses — apply a lower threshold of **20** (`kNebulaThreshold`), compensated by tighter differential-privacy parameters (ε = 1.0, δ = 1.0e-8).
+</Note>
+
+## Component Architecture
+
+The `components/p3a/` directory contains all analytics machinery.
+
+```
+components/p3a/
+├── p3a_service.{cc,h}           # Core service; manages histogram subscriptions
+├── message_manager.{cc,h}       # Routes metrics to Constellation or direct upload
+├── constellation_helper.{cc,h}  # High-level STAR measurement preparation
+├── constellation/               # Rust-backed STAR library bindings (sta-rs)
+├── metric_names.h               # Allowlist of reportable histogram names
+├── metric_config.{cc,h}         # Per-metric configuration (ephemeral, nebula, etc.)
+├── metric_log_type.{cc,h}       # Typical vs. express vs. slow log types
+├── rotation_scheduler.{cc,h}    # Controls when metric windows rotate
+├── star_randomness_points.{cc,h}# Network calls to the STAR randomness server
+├── uploader.{cc,h}              # Batches and POSTs encrypted measurements
+└── remote_config_manager.{cc,h} # Fetches per-metric server-side config overrides
+```
+
+`P3AService` is the central class. It is `base::RefCountedThreadSafe` because histogram update callbacks arrive on arbitrary threads, while the service logic runs on the UI thread.
+
+```cpp
+// From components/p3a/p3a_service.h
+class P3AService : public base::RefCountedThreadSafe<P3AService>,
+                   public MessageManager::Delegate,
+                   public p3a_utils::EventRelay::Observer,
+                   public RemoteConfigManager::Delegate {
+ public:
+  P3AService(PrefService& local_state,
+             std::string channel,
+             base::Time first_run_time,
+             P3AConfig config);
+
+  // Called by other components to register metrics not in metric_names.h
+  void RegisterDynamicMetric(const std::string& histogram_name,
+                             MetricLogType log_type,
+                             bool should_be_on_ui_thread = true);
+  void RemoveDynamicMetric(const std::string& histogram_name);
+
+  // Callback fires after rotation, before metrics are sent — use for
+  // just-in-time collection
+  base::CallbackListSubscription RegisterRotationCallback(
+      base::RepeatingCallback<void(MetricLogType log_type)> callback);
+};
+```
+
+## Recording P3A Metrics in C++
+
+Any histogram that appears in `metric_names.h` is automatically intercepted by `P3AService` when it is recorded via Chromium's standard UMA macros. The naming convention uses `Record*` prefixes per Brave's coding standards.
+
+```cpp
+// Standard UMA histogram — intercepted by P3AService if listed in metric_names.h
+base::UmaHistogramBoolean("Brave.AIChat.Enabled.2", is_enabled);
+
+// Explicit helper following Brave naming conventions (CS-005)
+void RecordAIChatEnabled(bool is_enabled) {
+  base::UmaHistogramBoolean("Brave.AIChat.Enabled.2", is_enabled);
+}
+```
+
+Metrics must be declared in the `kCollectedTypicalHistograms` (or express/slow variants) allowlist inside `metric_names.h` before they are reported. Each entry carries a `MetricConfig` struct:
+
+```cpp
+// From components/p3a/metric_names.h (excerpt)
+inline constexpr auto kCollectedTypicalHistograms =
+  base::MakeFixedFlatMap<std::string_view, std::optional<MetricConfig>>({
+    {"Brave.AIChat.Enabled.2", {}},
+    {"Brave.AIChat.ChatCount", MetricConfig{.ephemeral = true}},
+    {"Brave.AIChat.MostUsedEntryPoint", MetricConfig{
+      .ephemeral = true,
+      .attributes = MetricAttributes{
+        MetricAttribute::kCustomAttribute,
+        MetricAttribute::kAnswerIndex,
+        MetricAttribute::kYoi,
+        MetricAttribute::kChannel,
+        MetricAttribute::kPlatform,
+        MetricAttribute::kCountryCode,
+        MetricAttribute::kWoi,
+      },
+      .custom_attributes = {"day_zero"},
+    }},
+  });
+```
+
+<Tip>
+Set `ephemeral = true` for metrics where a value of zero is meaningless (e.g., counts that only exist when a feature is used). Ephemeral metrics are dropped from the report if no measurement was recorded during the window.
+</Tip>
+
+## Constellation Encryption Flow
+
+<Steps>
+  <Step title="Histogram fires">
+    A `base::UmaHistogram*` call records a value. `P3AService` receives the update via a `StatisticsRecorder` observer on any thread.
+  </Step>
+  <Step title="MessageManager routes to ConstellationHelper">
+    `MessageManager` selects the appropriate log type and hands the measurement to `ConstellationHelper`, which calls into the `sta-rs` Rust library.
+  </Step>
+  <Step title="STAR randomness fetch">
+    `StarRandomnessPoints` sends a blinded request to the STAR randomness server. The server returns a contribution without learning the plaintext metric value.
+  </Step>
+  <Step title="Measurement assembly">
+    The Rust library combines the client randomness, server contribution, and metric metadata into an encrypted Constellation message.
+
+    ```cpp
+    // From components/p3a/constellation_helper.h
+    // Threshold constants:
+    // kConstellationDefaultThreshold = 50  (typical metrics)
+    // kNebulaThreshold = 20                (Nebula differential-privacy metrics)
+    ```
+  </Step>
+  <Step title="Upload">
+    `Uploader` batches encrypted messages and POSTs them to the Constellation aggregation endpoint. The aggregation server accumulates ciphertexts and only recovers a value once the k-threshold is met.
+  </Step>
+</Steps>
+
+## Relationship with Griffin Experiments
+
+Griffin (the variations service) and P3A are complementary but independent systems. Griffin assigns browsers to experiment groups by enabling `base::Feature` flags; P3A reports aggregate outcomes for those groups. The connection is intentionally loose:
+
+- Griffin does **not** do telemetry itself.
+- P3A does **not** know about studies — it reports any listed histogram regardless of which Griffin group recorded it.
+- Experiment analysis is performed by correlating Griffin group membership (encoded in P3A message metadata such as `kCustomAttribute`) with histogram values after aggregation.
+
+```
+Browser                             Brave Servers
+──────                              ─────────────
+Griffin seed fetch ──────────────►  CDN (no logs)
+                                    
+base::Feature enabled               
+  │                                 
+  └─► histogram recorded            
+        │                           
+        └─► P3A Constellation ────► Aggregation (k-anon threshold)
+                                      │
+                                      └─► Metric value visible only
+                                          when k ≥ 50 users share it
+```
+
+<Warning>
+Disabling P3A in Brave settings disables all experiment reporting. Griffin studies that depend on P3A metrics for analysis will not produce usable results for browsers with P3A off.
+</Warning>
+
+## Privacy Properties Summary
+
+| Property | Guarantee |
+|---|---|
+| **k-anonymity** | A metric value is never revealed unless at least *k* users (default 50) share the same value for the same reporting window. |
+| **Server-side blindness** | The STAR randomness server never sees plaintext metric values; it only processes blinded cryptographic points. |
+| **No persistent request logs** | Seed and measurement endpoints are served through CDN configurations that do not persist per-request logs. |
+| **Open source** | All client code, the `sta-rs` library, and server configurations are publicly auditable. |
+| **P3A opt-out** | Users can disable P3A entirely from Brave settings, stopping all metric collection and experiment reporting. |

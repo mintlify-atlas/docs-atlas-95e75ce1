@@ -1,0 +1,159 @@
+---
+title: "Writing and Maintaining Chromium Patches in Brave"
+sidebarTitle: "Patches"
+description: "Write minimal, rebase-safe Chromium patches in Brave: define macros, include directives, GN list patterns, and what to avoid to prevent upgrade conflicts."
+---
+
+Brave Core modifies Chromium behavior through several override mechanisms: `chromium_src` overrides, bytecode adapters, and `.patch` files. Patches are the least-preferred mechanism because they carry the highest rebase risk — every Chromium version bump requires verifying that all patches still apply cleanly. The rules below minimize that risk by keeping patches small, addition-only, and extensible via `#define` macros and include directives.
+
+## The Core Rules
+
+<Steps>
+
+### Keep patches to functional changes only
+
+Patches should contain only the minimal functional changes needed. Never add comments, empty lines, whitespace changes, or any other non-functional modifications. Leave whitespace intact to minimize diff size.
+
+Unnecessary changes make patches harder to review and more likely to conflict during Chromium upgrades.
+
+### Prefer one-line patches
+
+Keep patches to one line even if it violates lint character line limits — lint doesn't run on patched files. Multiline logic belongs in a `chromium_src` override, not in a patch.
+
+### Use `#define` for extensibility
+
+Patches should use `#define` macros so that behavior can be extended in brave-core without changing the patch itself. Convention for define names: `BRAVE_ALL_CAPS_ORIGINAL_METHOD_NAME`.
+
+```cpp
+// ❌ WRONG - patching inline code directly
++  if (permission == AUTOPLAY) return true;
+
+// ✅ CORRECT - define macro that can be changed in brave-core
++#include "brave/chromium_src/path/to/override.h"
++BRAVE_PERMISSION_CONTROLLER_IMPL_METHOD
+```
+
+### Use `include` for extensible list patches
+
+When a patch adds to a list or block, use an `include` directive. This way additional items can be added in brave-core without modifying the patch file.
+
+</Steps>
+
+## GN Build File Patches
+
+<Accordion title="PATCH-008 — Use -= for list removal in GN patches">
+
+When removing items from GN lists, use `-=` instead of modifying the original line. This makes the patch an addition rather than a modification, reducing conflict risk.
+
+```gn
+# ❌ WRONG - modifying the original deps line
+-  public_deps += [ ":chrome_framework_widevine_signature" ]
+
+# ✅ CORRECT - separate removal line (addition-only patch)
++  public_deps -= [ ":chrome_framework_widevine_signature" ]
+```
+
+</Accordion>
+
+<Accordion title="PATCH-009 — Use deps += with a variable for extensible GN patches">
+
+When a patch adds dependencies to a Chromium BUILD.gn target, define a variable in Brave code and patch only the variable reference. This allows adding/removing deps without modifying the patch.
+
+```gn
+# ❌ WRONG - patching inline deps
++  deps += [ "//brave/browser/ui/views/location_bar" ]
+
+# ✅ CORRECT - patch references a variable defined in brave-core
++  deps += brave_browser_window_deps
+```
+
+In brave-core:
+
+```gn
+brave_browser_window_deps = [
+  "//brave/browser/ui/views/location_bar",
+]
+```
+
+</Accordion>
+
+## XML Patches
+
+When patching XML files (Android layouts, GRD string files, etc.), use HTML comments rather than deleting lines to reduce the diff size and avoid modifying existing lines.
+
+```xml
+<!-- ❌ WRONG - deleting XML elements (large diff, modifies existing lines) -->
+-<LinearLayout ...>
+-  ...
+-</LinearLayout>
+
+<!-- ✅ CORRECT - commenting out preserves lines, smaller diff -->
++<!--
+ <LinearLayout ...>
+   ...
+ </LinearLayout>
++-->
+```
+
+## What to Avoid
+
+<Warning>
+  **Never create multiline patches.** If your change requires more than one line, use a `#define` macro or `chromium_src` override instead. Multiline patches are the primary source of rebase conflicts.
+</Warning>
+
+<Warning>
+  **Never patch Python build scripts** (e.g., `java_cpp_enum.py` or similar build tools). These patches prevent correct incremental rebuilds and break remote `siso` build actions. Instead prefer: a `chromium_src` override, a multiline header patch, or a `#define`-based approach.
+</Warning>
+
+<Accordion title="PATCH-010 — Alternatives to Python script patches">
+
+For Java/C++ enums processed by upstream Python scripts, a multiline patch in the header file is acceptable as a pragmatic solution. For other Python build tool modifications:
+
+1. Use a `chromium_src` override if the build script has an identifiable override point
+2. Use a multiline header patch that the Python script processes
+3. Use a `#define`-based approach that changes behavior at compile time rather than at build-script time
+
+</Accordion>
+
+## Patch Style Summary
+
+| Scenario | Recommended Approach |
+|---|---|
+| Adding inline behavior | `#define BRAVE_METHOD_NAME` + `#include` in brave-core |
+| Adding to a GN `deps` list | `deps += variable_name` where variable is in brave-core |
+| Removing from a GN list | `deps -= [ "..." ]` on a new line |
+| Hiding an XML element | Wrap with `<!-- -->` comment |
+| Modifying upstream strings | `chromium_src` override with `#undef`/`#define` IDS_ |
+| Python build script change | `chromium_src` override or header-level `#define` |
+| Multiline logic change | `chromium_src` override (not a patch) |
+
+## Adding Lines vs. Modifying Lines
+
+When creating direct patches (non-`chromium_src` overrides), prefer **adding entirely new lines** rather than modifying existing upstream lines. New lines have no upstream anchor that might change — the patch will apply cleanly even if surrounding lines shift.
+
+```diff
+# ❌ WRONG - modifying an existing line creates a fragile anchor
+-  std::string result = ComputeResult(input);
++  std::string result = BraveComputeResult(input);
+
+# ✅ CORRECT - add a new line after the existing one
+   std::string result = ComputeResult(input);
++  result = BravePostProcess(result);
+```
+
+## Patches Are Acceptable for Anonymous Inner Classes
+
+When the Brave override system cannot handle anonymous inner classes in upstream Chromium Java code, a `.patch` file is the accepted fallback. Document the reason in the PR and link to the tracking issue for better override support.
+
+## Keeping Patches Rebased
+
+Patches must be verified on every Chromium version bump. The `update_patches` workflow re-applies all patches and flags any that fail to apply cleanly. When a patch conflict occurs:
+
+1. Identify whether the upstream code change affects the behavior the patch implements
+2. If the upstream change makes the patch unnecessary, remove it entirely
+3. If the upstream change requires updating the patch, update it minimally — only the changed anchor lines
+4. Never expand the scope of a patch during a rebase fix
+
+<Tip>
+  The least-maintenance patch is no patch at all. Before writing a patch, check whether the same behavior can be achieved via a `chromium_src` override, a bytecode adapter, or a feature flag default in GN build args.
+</Tip>

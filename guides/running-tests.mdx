@@ -1,0 +1,118 @@
+---
+title: "Running Brave and Chromium Test Suites"
+sidebarTitle: "Running Tests"
+description: "A complete reference for running C++ and JS/TS test suites in brave-core: available test targets, the pnpm run test command, --filter wildcards, and JS unit test execution."
+---
+
+Brave Core ships with a large set of automated tests that span C++ unit tests, browser integration tests, and TypeScript/React unit tests. Understanding which suite to use — and how to narrow test runs to the relevant subset — keeps iteration times fast during development.
+
+## C++ Test Suites
+
+C++ tests are compiled into dedicated test binaries and run via the `pnpm run test` command. Each suite covers a different scope:
+
+| Suite | What it tests |
+|-------|--------------|
+| `brave_components_unittests` | C++ unit tests located in `brave/components/` |
+| `brave_unit_tests` | C++ unit tests anywhere else in `brave/` |
+| `brave_browser_tests` | Brave-specific browser integration tests |
+| `chromium_unit_tests` | Upstream Chromium C++ unit tests in `src/` |
+| `browser_tests` | Upstream Chromium browser integration tests in `src/` |
+
+## Running Tests
+
+The general syntax is:
+
+```sh
+pnpm run test [test-suite] --filter="[filter-pattern]"
+```
+
+<CodeGroup>
+```sh Run all Brave component unit tests
+pnpm run test brave_components_unittests
+```
+
+```sh Run all Brave unit tests
+pnpm run test brave_unit_tests
+```
+
+```sh Run Brave browser integration tests
+pnpm run test brave_browser_tests
+```
+
+```sh Run Chromium unit tests
+pnpm run test chromium_unit_tests
+```
+
+```sh Run upstream browser tests
+pnpm run test browser_tests
+```
+</CodeGroup>
+
+## Filtering Tests with `--filter`
+
+The `--filter` flag accepts the full `FixtureName.TestName` pattern and supports wildcards (`*`) for partial matching. Multiple patterns can be combined with `:`.
+
+<CodeGroup>
+```sh Exact fixture and test name
+pnpm run test brave_unit_tests --filter="BraveShieldsHandlerTest.GetAdBlockSettingsForUrl"
+```
+
+```sh Wildcard on test name
+pnpm run test brave_components_unittests --filter="BraveShields*"
+```
+
+```sh Wildcard on both parts
+pnpm run test brave_unit_tests --filter="*Foo*"
+```
+
+```sh Combine multiple patterns with ':'
+pnpm run test brave_browser_tests --filter="*Foo*:*Bar*"
+```
+</CodeGroup>
+
+<Note>
+The filter syntax follows GTest conventions. The full test name is `FixtureName.TestName` and `*` matches any substring. See [Chromium's testing docs](https://chromium.googlesource.com/chromium/src/+/main/docs/testing_in_chromium.md) for advanced filter patterns.
+</Note>
+
+## JavaScript and TypeScript Unit Tests
+
+Frontend `*.test.ts(x)` files are run with Jest via a separate command. These tests do not require building a Chromium binary — they run entirely in Node/JSDOM and complete in seconds.
+
+```sh
+# Run all JS/TS unit tests
+pnpm run test-unit
+
+# Filter to tests whose name matches a substring
+pnpm run test-unit -t "should render items"
+
+# Filter to test files matching a path glob
+pnpm run test-unit components/brave_new_tab_ui
+
+# Watch mode: automatically re-run affected tests on file save
+pnpm run test-unit --watch
+```
+
+<Tip>
+Use `pnpm run test-unit --watch` during active frontend development. Jest's watch mode only re-runs tests affected by your file changes, so feedback is nearly instant.
+</Tip>
+
+## Choosing the Right Suite
+
+<CardGroup cols={2}>
+  <Card title="Writing new C++ logic?" icon="c">
+    Run `brave_unit_tests` or `brave_components_unittests` depending on where your code lives. These compile and run without a browser window.
+  </Card>
+  <Card title="Writing browser UI interactions?" icon="browser">
+    Use `brave_browser_tests` for Brave-specific flows. These launch a full browser process and are slower but test real browser behavior.
+  </Card>
+  <Card title="Modifying a React/TS WebUI page?" icon="react">
+    Run `pnpm run test-unit` for fast iteration. Jest runs in JSDOM without Chromium.
+  </Card>
+  <Card title="Adapting an upstream Chromium test?" icon="wrench">
+    You may need to run both `chromium_unit_tests` and a `brave_*` suite. See [Adapting Chromium Tests](./adapting-chromium-tests) for the strategies involved.
+  </Card>
+</CardGroup>
+
+## Further Reading
+
+For a deep dive into Chromium's broader testing infrastructure (test isolation, build configurations, and flakiness handling), see the upstream [Testing in Chromium](https://chromium.googlesource.com/chromium/src/+/main/docs/testing_in_chromium.md) documentation.

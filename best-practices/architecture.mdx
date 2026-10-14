@@ -1,0 +1,344 @@
+---
+title: "Architecture Rules and Patterns for Brave Core C++"
+sidebarTitle: "Architecture"
+description: "Brave Core enforces Chromium's layer hierarchy with additional rules: no bag-of-stuff objects, internal feature guards, DependsOn factories, and abstract base classes for cross-layer access."
+---
+
+Brave Core inherits and extends Chromium's architectural constraints. Code that violates the dependency layer hierarchy, passes oversized "bag-of-stuff" objects, or reaches for global state from the wrong layer will fail code review. This page documents the most important enforced rules with the real code examples from the source that justify each one.
+
+## ARCH-001: Chromium Dependency Layer Hierarchy
+
+All Chromium (and Brave) code is organised into layers. Dependencies must only flow **downward** — a lower layer must never depend on a higher one.
+
+```
+┌─────────────────────────────────────────────────────┐
+│  //chrome, //android_webview, //ios, ...            │  ← Embedders (top-level apps)
+├─────────────────────────────────────────────────────┤
+│  //components                                       │  ← Optional reusable features
+├─────────────────────────────────────────────────────┤
+│  //content (Content API)                            │  ← Multi-process web platform
+├─────────────────────────────────────────────────────┤
+│  //net, //ui, ...                                   │  ← Core libraries
+├─────────────────────────────────────────────────────┤
+│  //base                                             │  ← Foundation
+└─────────────────────────────────────────────────────┘
+```
+
+In Brave's layout: `brave/browser/` is the embedder layer, `brave/components/` is the components layer. The same downward-only rule applies.
+
+<Note>
+Components shared with iOS must either have zero `//content` dependencies or use a layered `core/` + `content/` split. See ARCH-037 below.
+</Note>
+
+## Key Rules by Category
+
+<Accordion title="ARCH-002: No Layering Violations — Components Cannot Depend on Browser">
+**`components/` code must never use `g_browser_process` or include headers from `brave/browser/`.** Fix violations by passing dependencies via constructors or `Init()` methods.
+
+```cpp
+// ❌ WRONG — components/ using g_browser_process
+void P3AService::Init() {
+  url_loader_factory_ =
+      g_browser_process->shared_url_loader_factory();  // Layering violation!
+}
+
+// ✅ CORRECT — dependency injected via Init()
+void P3AService::Init(
+    scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory) {
+  url_loader_factory_ = url_loader_factory;
+}
+```
+
+Also: never use `Profile` in components — pass `PrefService` instead (via `user_prefs::UserPrefs::Get(browser_context)`).
+</Accordion>
+
+<Accordion title="ARCH-003: Pass the Most Specific Dependency, Not a Bag-of-Stuff Object">
+**Always pass the most fundamental object a function actually needs.** Passing a `Profile*` when only prefs are needed creates hidden coupling and prevents iOS reuse.
+
+```cpp
+// ❌ WRONG — passing Profile when only prefs are needed
+void MyComponent::Init(Profile* profile) {
+  enabled_ = profile->GetPrefs()->GetBoolean(kMyPref);
+}
+
+// ✅ CORRECT — pass only what's needed
+void MyComponent::Init(PrefService* prefs) {
+  enabled_ = prefs->GetBoolean(kMyPref);
+}
+```
+
+If a class holds a `Profile*` solely to call `SomeService::Get(profile)`, inject the service instead:
+
+```cpp
+// ❌ WRONG — holding Profile only to fetch another service
+BraveExtensionService::BraveExtensionService(Profile* profile)
+    : profile_(profile) {}
+
+void BraveExtensionService::OnMalwareListUpdated() {
+  ExtensionSystem* extension_system = ExtensionSystem::Get(profile_);
+}
+
+// ✅ CORRECT — inject the service actually needed
+BraveExtensionService::BraveExtensionService(ExtensionSystem* extension_system)
+    : extension_system_(extension_system) {}
+```
+
+Common substitutions: `Profile*` → `PrefService*`, `Profile*` → `BrowserContext*`, `BrowserContext*` → `scoped_refptr<URLLoaderFactory>`.
+</Accordion>
+
+<Accordion title="ARCH-004: Prefer Internal Feature Guards Over External Ifdefs">
+**When a feature can be disabled, make the factory return null rather than requiring every caller to add `#ifdef` guards.** Scattered buildflags lead to missing deps and maintenance burden.
+
+```cpp
+// ❌ WRONG — external ifdef guards everywhere
+#if BUILDFLAG(BRAVE_REWARDS_ENABLED)
+  auto* rewards_service = RewardsServiceFactory::GetForProfile(profile);
+  rewards_service->DoSomething();
+#endif
+
+// ✅ CORRECT — factory handles disabled state internally
+auto* rewards_service = RewardsServiceFactory::GetForProfile(profile);
+if (rewards_service) {  // Returns null when disabled
+  rewards_service->DoSomething();
+}
+```
+</Accordion>
+
+<Accordion title="ARCH-014: Use Abstract Base Classes to Avoid Layering Violations">
+**When browser-layer code needs to be accessible from components, create an abstract base class in `components/` and implement it in `browser/`.** The component depends on the interface, not the implementation.
+
+```cpp
+// ✅ In components/ — abstract interface
+class BraveOmniboxClient {
+ public:
+  virtual bool IsAutocompleteEnabled() = 0;
+};
+
+// ✅ In browser/ — concrete implementation
+class BraveOmniboxClientImpl : public BraveOmniboxClient {
+  bool IsAutocompleteEnabled() override { ... }
+};
+```
+</Accordion>
+
+## Factory Patterns
+
+<Accordion title="ARCH-011: Use DependsOn for Factory Dependencies">
+**If your `KeyedServiceFactory` depends on other services, declare it with `DependsOn`.** This ensures correct initialisation order at browser startup.
+
+```cpp
+MyServiceFactory::MyServiceFactory()
+    : BrowserContextKeyedServiceFactory(...) {
+  DependsOn(RewardsServiceFactory::GetInstance());
+  DependsOn(AdsServiceFactory::GetInstance());
+}
+```
+</Accordion>
+
+<Accordion title="ARCH-012: Return Null for Incognito Profiles">
+**If a service shouldn't be active in incognito, return null from `GetBrowserContextToUse`.** Never initialise services for profile types they shouldn't support.
+
+```cpp
+// ❌ WRONG — returns the profile even for incognito
+content::BrowserContext* GetBrowserContextToUse(
+    content::BrowserContext* context) const override {
+  return context;  // Creates services for incognito!
+}
+
+// ✅ CORRECT — return null for unsupported profiles
+content::BrowserContext* GetBrowserContextToUse(
+    content::BrowserContext* context) const override {
+  if (context->IsOffTheRecord())
+    return nullptr;
+  return context;
+}
+```
+</Accordion>
+
+<Accordion title="ARCH-025: Pass Dependencies via Constructors, Not Setter Callbacks">
+**Pass dependencies through the constructor rather than a separate `Set*Callback` method.** Constructor injection makes dependencies explicit and prevents confusing initialisation ordering.
+
+```cpp
+// ❌ WRONG — setting callback from an unrelated factory
+void BraveVpnServiceFactory::BuildServiceInstanceFor(...) {
+  auto* manager = BraveVPNConnectionManager::GetInstance();
+  manager->SetInstallSystemServiceCallback(base::BindRepeating(...));
+}
+
+// ✅ CORRECT — pass dependency via constructor
+BraveVPNConnectionManager::BraveVPNConnectionManager(
+    base::RepeatingCallback<void()> install_callback)
+    : install_system_service_callback_(std::move(install_callback)) {}
+```
+</Accordion>
+
+<Accordion title="ARCH-072: Factory Return Value Must Be Stable Across the Session">
+**A `KeyedServiceFactory` may only return `nullptr` based on attributes that are fixed for the browser session** — profile type, buildflags, `base::Feature` flags. Never gate on user-modifiable prefs.
+
+```cpp
+// ❌ WRONG — factory result depends on a runtime-toggleable pref
+std::unique_ptr<KeyedService>
+BraveWalletServiceFactory::BuildServiceInstanceForBrowserContext(
+    content::BrowserContext* context) const {
+  PrefService* prefs = user_prefs::UserPrefs::Get(context);
+  if (!prefs->GetBoolean(kBraveWalletEnabledPref)) {
+    return nullptr;  // User toggling the pref requires a restart
+  }
+  return std::make_unique<BraveWalletService>(...);
+}
+
+// ✅ CORRECT — factory always builds; service reads pref at runtime
+std::unique_ptr<KeyedService>
+BraveWalletServiceFactory::BuildServiceInstanceForBrowserContext(
+    content::BrowserContext* context) const {
+  return std::make_unique<BraveWalletService>(
+      user_prefs::UserPrefs::Get(context), ...);
+}
+```
+</Accordion>
+
+## iOS Compatibility
+
+<Accordion title="ARCH-037: Layered Component Structure (core/ + content/) for iOS">
+**Components that must build for both iOS and content-based platforms use a split directory structure.** `core/` contains iOS-compatible code with no `//content` dependencies; `content/` contains the content-layer glue.
+
+```
+components/brave_shields/
+├── core/           # iOS-compatible: no //content deps
+│   ├── browser/    # Browser-process logic
+│   ├── common/     # Shared across processes
+│   └── test/
+└── content/        # Content-layer integration
+    ├── browser/    # Uses WebContents, BrowserContext
+    └── test/
+```
+
+Rules:
+- `core/` must never depend on `//content` or `content/` subdirectories
+- `content/` may depend on `core/` and `//content`
+- iOS builds pull in only `core/`
+- Business logic belongs in `core/`; content-layer glue in `content/`
+</Accordion>
+
+<Accordion title="ARCH-035: Mojom Enums Must Be Top-Level When Targeting iOS">
+**Mojom enums cannot be nested inside mojom structs when the target includes iOS.** The Objective-C++ code generator produces invalid code for nested enums.
+
+```mojom
+// ❌ WRONG — nested enum breaks iOS build
+struct ModelConfig {
+  enum Category {
+    kChat = 0,
+    kCompletion = 1,
+  };
+  Category category;
+};
+
+// ✅ CORRECT — top-level enum
+enum ModelCategory {
+  kChat = 0,
+  kCompletion = 1,
+};
+
+struct ModelConfig {
+  ModelCategory category;
+};
+```
+</Accordion>
+
+## Tab-Scoped Features
+
+<Accordion title="ARCH-074: Own Tab-Scoped Features in BraveTabFeatures">
+**A feature scoped to a tab is a `std::unique_ptr` member of `BraveTabFeatures`, created in its `Init()`, not a `WebContentsUserData` helper attached via `AttachTabHelpers`.** Upstream is removing `AttachTabHelpers` on desktop.
+
+```cpp
+// ❌ WRONG — tab-scoped feature attached to the WebContents
+// browser/brave_tab_helpers.cc
+FooTabHelper::MaybeCreateForWebContents(web_contents);
+
+// ✅ CORRECT — owned by BraveTabFeatures
+// browser/ui/tabs/brave_tab_features.cc
+void BraveTabFeatures::Init(TabInterface& tab, Profile* profile) {
+  TabFeatures::Init(tab, profile);
+  if (base::FeatureList::IsEnabled(kFoo)) {
+    foo_ = std::make_unique<FooTabFeature>(tab);
+  }
+}
+```
+
+If code outside the feature needs to look up the feature for a given tab, expose it via `UnownedUserData` (`X::From(tab)`) rather than `X::FromWebContents()`.
+</Accordion>
+
+<Accordion title="ARCH-075: Don't Cache the Tab's WebContents in a Tab Feature">
+**On desktop, a tab's `WebContents` is replaced on discard.** A tab feature must not hold on to the `WebContents` it was created with; use `ContentsObservingTabFeature` to follow the tab across discards.
+
+```cpp
+// ❌ WRONG — bound to the contents the tab had at Init()
+class FooTabFeature : public content::WebContentsObserver {
+ public:
+  explicit FooTabFeature(tabs::TabInterface& tab)
+      : WebContentsObserver(tab.GetContents()) {}
+};
+
+// ✅ CORRECT — follows the tab's contents across discards
+class FooTabFeature : public tabs::ContentsObservingTabFeature {
+ public:
+  explicit FooTabFeature(tabs::TabInterface& tab)
+      : ContentsObservingTabFeature(tab) {}
+};
+```
+</Accordion>
+
+## Additional Patterns
+
+<Accordion title="ARCH-021: Callbacks for Queries, Observers for State Changes">
+**Observer methods should only be triggered by state changes (Set/Create/Delete), never by query responses (Get/Fetch).** Use callbacks for query responses.
+
+```cpp
+// ❌ WRONG — observer triggered by a query
+void RewardsService::GetRecurringDonations() {
+  ledger->GetRecurringDonations([this](auto list) {
+    for (auto& observer : observers_)
+      observer.OnRecurringDonationsList(list);  // Wrong!
+  });
+}
+
+// ✅ CORRECT — callback for query, observer for state change
+void RewardsService::GetRecurringDonations(GetDonationsCallback callback) {
+  ledger->GetRecurringDonations(std::move(callback));
+}
+
+void RewardsService::SetRecurringDonation(amount) {
+  SaveToDB(amount);
+  for (auto& observer : observers_)
+    observer.OnRecurringDonationUpdated();
+}
+```
+</Accordion>
+
+<Accordion title="ARCH-030: Guard Significant New Functionality Behind base::Feature">
+**Large or risky features should be guarded behind a `base::Feature` flag** so they can be remotely disabled via Griffin if issues arise. Small bug fixes do not need a flag.
+
+```cpp
+// ✅ CORRECT — guarded behind feature flag
+if (!base::FeatureList::IsEnabled(features::kMyNewFeature)) {
+  return;
+}
+auto* service = MyNewServiceFactory::GetForProfile(profile);
+if (!service) {
+  return;
+}
+service->DoSomething();
+```
+</Accordion>
+
+<Accordion title="ARCH-018: File Organization by Component">
+**Group files by component, not by platform.** `brave_rewards/android/` is preferred over `android/rewards/`.
+
+```
+# ❌ WRONG
+brave/browser/android/rewards/brave_rewards_native_worker.cc
+
+# ✅ CORRECT
+brave/browser/brave_rewards/android/brave_rewards_native_worker.cc
+```
+</Accordion>

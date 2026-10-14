@@ -1,0 +1,239 @@
+---
+title: "Localizing and Translating Brave"
+sidebarTitle: "Localization"
+description: "How Brave manages UI string resources in GRD/GRDP files, syncs translations via Transifex, and enforces i18n conventions for placeholders, descriptions, and WebUI bindings."
+---
+
+Brave is a global product used in dozens of languages, and high-quality localization is a first-class concern throughout the development process. All user-facing strings start life in English (`en-US`) and are then translated by real people through Brave's Transifex project. This guide covers the technical conventions for authoring string resources, the tooling that keeps translated strings in sync, and the rules that keep string quality high enough that translators can do their jobs accurately.
+
+## Translation Platform: Transifex
+
+Brave manages all of its community and professional translations through **Transifex**. If you notice that your preferred language is missing, incomplete, or contains poor-quality translations, you can:
+
+- **Report the issue** by emailing [localization@brave.com](mailto:localization@brave.com).
+- **Volunteer as a translator** — Brave considers volunteer translators on a case-by-case basis, particularly from contributors who represent a specific language community. Reach out to [localization@brave.com](mailto:localization@brave.com) to express your interest.
+- **Contribute directly** via the public Transifex project at [https://explore.transifex.com/brave/brave_en/](https://explore.transifex.com/brave/brave_en/).
+
+<Note>
+  Language support varies by platform. Brave continuously reviews whether new languages are needed, but it is not possible to support all languages on all platforms simultaneously.
+</Note>
+
+## String Resource Files: GRD and GRDP
+
+Brave uses the Chromium **GRIT** (Google Resource and Internationalization Tool) system to manage localized strings. Strings are defined in two file types:
+
+- **`.grd` files** — top-level resource descriptor files that reference one or more `.grdp` parts files.
+- **`.grdp` files** — the individual string parts files where `<message>` elements live.
+
+Brave-specific strings belong in Brave's own GRD/GRDP files — for example:
+
+| Purpose | File |
+|---|---|
+| General desktop UI | `app/brave_generated_resources.grd` |
+| Settings strings | `app/brave_settings_strings.grdp` |
+| Android strings | `browser/ui/android/strings/android_brave_strings.grd` |
+| Component strings | `components/brave_components_strings.grdp` |
+
+<Warning>
+  **Never add or modify strings in upstream Chromium GRD/GRDP files** such as `app/generated_resources.grd` or `components/browser_ui/strings/android/browser_ui_strings.grd`. These files are automatically replaced during every Chromium version bump — any changes will be lost on the next rebase.
+</Warning>
+
+### Overriding Upstream Strings
+
+To replace an upstream Chromium string with a Brave-specific version, add your replacement string to the appropriate Brave GRDP file and then create a `chromium_src` override that redefines the upstream `IDS_` constant to point to your new string.
+
+```cpp
+// chromium_src/chrome/browser/ui/webui/password_manager/password_manager_ui.cc
+#undef IDS_PASSWORD_MANAGER_UI_EMPTY_STATE_SYNCING_USERS
+#define IDS_PASSWORD_MANAGER_UI_EMPTY_STATE_SYNCING_USERS \
+  IDS_BRAVE_PASSWORD_MANAGER_UI_EMPTY_STATE_SIGNEDOUT_USERS
+```
+
+For simple word or phrase substitutions that need to apply across all locales (e.g., replacing "Chrome" with "Brave" in upstream strings), use `brave/script/lib/l10n/grd_string_replacements.py` with `default_replacements` and run the rebase helper:
+
+```bash
+pnpm run chromium_rebase_l10n
+```
+
+## Writing High-Quality String Resources
+
+Every `<message>` element you add must follow these conventions so translators can do their work accurately and the build system can process strings correctly.
+
+### Required: Non-empty `desc` attributes
+
+Every `<message>` element must have a descriptive, unique `desc` attribute. Translators only see the description and the English source text — a vague or missing description leads directly to poor translations.
+
+```xml
+<!-- ✅ CORRECT - clear element type and context -->
+<message name="IDS_BRAVE_WALLET_SEND_BUTTON"
+         desc="Button label that submits a send transaction in the Brave Wallet send panel">
+  Send
+</message>
+
+<!-- ❌ WRONG - empty description gives translators no context -->
+<message name="IDS_BRAVE_WALLET_SEND_BUTTON" desc="">
+  Send
+</message>
+```
+
+Descriptions should:
+- Specify the **UI element type** (button label, page title, tooltip, menu item, placeholder, etc.)
+- **Disambiguate terms** with multiple meanings — "History" (browser history vs. conversation history), "Wallet" (crypto wallet vs. payment method), "Send" (send to where?)
+- Be **unique across strings** — do not copy-paste the same `desc` for different purposes
+
+### Placeholders: SCREAMING_SNAKE_CASE with `<ex>` tags
+
+Placeholders must use descriptive `SCREAMING_SNAKE_CASE` names and include an `<ex>` example tag so translators know what value will appear at runtime.
+
+```xml
+<!-- ✅ CORRECT - descriptive name and runtime example -->
+<message name="IDS_SHRED_CONFIRMATION"
+         desc="Confirmation dialog body for shredding all site data for a domain">
+  Shredding will delete site data and close all
+  <ph name="SITE_NAME">$1<ex>example.com</ex></ph> tabs.
+</message>
+
+<!-- For link wrapping, use LINK_BEGIN / LINK_END pattern -->
+<message name="IDS_BRAVE_LEARN_MORE"
+         desc="Body text with a learn more hyperlink">
+  <ph name="LINK_BEGIN">$1</ph>Learn more<ph name="LINK_END">$2</ph>
+</message>
+
+<!-- ❌ WRONG - generic name, no example -->
+<message name="IDS_SHRED_CONFIRMATION" desc="Confirmation">
+  Shredding will delete site data for <ph name="PH_1">$1</ph>.
+</message>
+```
+
+### Translateable attribute
+
+In `.grdp` files, `translateable="true"` is the **default** — never add it explicitly. Only `translateable="false"` needs to be specified when you want to exclude a string from translation.
+
+### Never add unused strings
+
+Every string in a GRD/GRDP file is sent to translators and translated into every supported language. Only add strings that are actively referenced in the codebase, and remove strings when they are no longer used after a refactor.
+
+## WebUI String Bindings
+
+Brave extends GRIT to automatically generate TypeScript and C++ bindings for strings used in WebUI components. This removes the need to manually call `source->AddLocalizedString()` for each individual string and eliminates stringly-typed `getLocale()` calls.
+
+### Marking strings for WebUI generation
+
+Add the `formatter_data="webui=ComponentName"` attribute to any `<message>` element that needs to be accessible in a WebUI. The component name must exactly match the WebUI identifier used in the build system.
+
+```xml
+<!-- In my_strings.grdp -->
+<!-- ✅ CORRECT - formatter_data value matches the WebUI component exactly -->
+<message name="IDS_MY_UI_MESSAGE_NAME"
+         desc="Welcome header for My UI page"
+         formatter_data="webui=MyUi">
+  Welcome to My UI
+</message>
+```
+
+### Using generated bindings in C++
+
+Once `formatter_data` is set, include the generated header and use the batch helper instead of per-string calls:
+
+```cpp
+// my_ui.cc
+#include "components/grit/brave_components_webui_strings.h"
+
+MyUi::MyUi(WebUI* ui) {
+  content::WebUIDataSource* source = ...;
+  // Replace individual AddLocalizedString calls:
+  // source->AddLocalizedString("messageName", IDS_MY_UI_MESSAGE_NAME);
+  source->AddLocalizedStrings(webui::kMyUiStrings);
+}
+```
+
+### Using generated bindings in TypeScript
+
+Import the generated enum and use it for type-safe string access, instead of raw string keys:
+
+```tsx
+// my_component.tsx
+import { MyUiStrings } from 'gen/components/grit/brave_components_webui_strings'
+
+export default function Component() {
+  return <div>
+    {getLocale(MyUiStrings.MY_UI_MESSAGE_NAME)}
+  </div>
+}
+```
+
+For convenience, Brave WebUIs typically re-export the enum under a global `S` alias so individual components don't need to repeat the import:
+
+<Steps>
+  <Step title="Create strings.ts in your WebUI's resources directory">
+    ```ts
+    // resources/strings.ts
+    import '$web-common/strings'
+    import { MyUiStrings } from 'gen/components/grit/brave_components_webui_strings'
+
+    declare global {
+      interface Strings {
+        MyUiStrings: typeof MyUiStrings
+      }
+    }
+    ```
+  </Step>
+  <Step title="Import strings.ts from your UI entry point">
+    ```tsx
+    // my_ui.tsx
+    import './strings'
+    ```
+  </Step>
+  <Step title="Use S.* from any file in the UI without additional imports">
+    ```tsx
+    // my_component.tsx
+    export default function Component() {
+      return <div>
+        {getLocale(S.MY_UI_MESSAGE_NAME)}
+      </div>
+    }
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+  For a real-world example of converting a large WebUI to use generated string bindings, see the [AIChat migration PR](https://github.com/brave/brave-core/pull/29505) on GitHub.
+</Tip>
+
+### Never dynamically construct string keys
+
+Static analysis tools and dead-string detection rely on being able to statically resolve every `getLocale()` call. Dynamic key construction breaks both:
+
+```tsx
+// ❌ WRONG - key constructed at runtime, breaks static analysis
+getLocale(`CHAT_UI_${model.key.toUpperCase().replaceAll('-', '_')}_SUBTITLE`)
+
+// ✅ CORRECT - explicit static reference
+getLocale(S.CHAT_UI_CLAUDE_SUBTITLE)
+```
+
+## Syncing Translations with Transifex
+
+Brave uses two `pnpm` scripts to push source strings up to Transifex and pull completed translations back into the repository:
+
+```bash
+# Push new or updated English source strings to Transifex
+pnpm run push_l10n
+
+# Pull completed translations from Transifex into the repo
+pnpm run pull_l10n
+```
+
+These commands are typically run by the Brave localization team during the release cycle. If you are a contributor adding new strings, ensure your strings have been pushed to Transifex before the translation window for the next release closes.
+
+## PR Requirements for String Changes
+
+<Info>
+  When a PR adds or modifies any user-facing string, the PR description must include a **screenshot of the affected UI** as rendered in the browser. This allows string reviewers to verify the string in context — checking for truncation, capitalization consistency, layout issues, and correct terminology. Add the screenshot to the PR description body, not as an inline code comment.
+</Info>
+
+String changes have additional review requirements beyond standard code review:
+
+- A **Brave string reviewer** will verify the quality of `desc` attributes, placeholder names, and that strings follow the [Brave Style Guide](https://github.com/brave/brave-core/blob/master/docs/best-practices/style-guide.md).
+- During **Chromium rebases**, review all new upstream strings for Google product references (Gemini, Google Pay, Chrome, etc.) that need to be replaced with Brave equivalents.
+- Confirm the correct product name terminology — "Brave Wallet" refers specifically to the cryptocurrency wallet, not general autofill or payment card features.

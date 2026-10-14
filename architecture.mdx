@@ -1,0 +1,242 @@
+---
+title: "Brave Core Architecture and Code Organization"
+sidebarTitle: "Architecture"
+description: "How Brave Core follows Chromium's strict dependency layering model, where brave/browser is the embedder and brave/components mirrors //components rules."
+---
+
+Brave Core is not an arbitrary collection of changes dropped on top of Chromium — it follows the same architectural principles that Chromium itself uses to stay maintainable at scale. Understanding those principles is essential before writing any Brave-specific code, because violations detected during code review will block merging regardless of the feature's correctness.
+
+## Chromium Dependency Layer Hierarchy
+
+All Chromium code (and by extension, all Brave Core code) is organized into layers with a single strict rule: **dependencies flow downward only**. Code in a lower layer must never depend on a higher layer.
+
+```text
+┌─────────────────────────────────────────────────────┐
+│  //chrome, //android_webview, //ios, ...            │  ← Embedders (top-level apps)
+├─────────────────────────────────────────────────────┤
+│  //components                                       │  ← Optional reusable features
+├─────────────────────────────────────────────────────┤
+│  //content (Content API)                            │  ← Multi-process web platform
+├─────────────────────────────────────────────────────┤
+│  //net, //ui, ...                                   │  ← Core libraries
+├─────────────────────────────────────────────────────┤
+│  //base                                             │  ← Foundation
+└─────────────────────────────────────────────────────┘
+```
+
+In Brave Core, the mapping is direct:
+- `brave/browser/` is the **embedder layer** — analogous to `//chrome`.
+- `brave/components/` is the **components layer** — analogous to `//components`.
+
+The same downward-only rules apply to both.
+
+<Note>
+  **The most important rule:** Code in `brave/components/` must **never** depend on `brave/browser/` or use `g_browser_process`. Components are a lower layer than the browser; referencing browser-layer code from a component is a layering violation that will fail review. Fix it by passing dependencies via constructor injection or `Init()` parameters.
+</Note>
+
+## The Layering Violation Pattern — and the Fix
+
+The single most common architecture mistake in Brave Core contributions is a component reaching up into the browser layer to fetch a dependency. Here is what it looks like and how to correct it:
+
+<Tabs>
+  <Tab title="❌ Violation">
+    ```cpp
+    // In components/p3a/p3a_service.cc
+    // WRONG: component code using g_browser_process (browser-layer global)
+    void P3AService::Init() {
+      url_loader_factory_ =
+          g_browser_process->shared_url_loader_factory();  // Layering violation!
+    }
+    ```
+  </Tab>
+  <Tab title="✅ Correct">
+    ```cpp
+    // In components/p3a/p3a_service.cc
+    // CORRECT: dependency injected via Init() parameter
+    void P3AService::Init(
+        scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory) {
+      url_loader_factory_ = url_loader_factory;
+    }
+    ```
+  </Tab>
+</Tabs>
+
+The browser layer calls `P3AService::Init(g_browser_process->shared_url_loader_factory())` — the dependency flows downward, not upward.
+
+## brave/browser/ vs brave/components/
+
+### brave/components/
+
+`brave/components/` follows the same rules as Chromium's `//components`:
+
+- May depend on `//content`, `//net`, `//base`, and other `//components`.
+- Must **never** depend on `//chrome`, `brave/browser/`, or `chrome/browser/`.
+- Must never use `Profile` — use `PrefService` (obtained via `user_prefs::UserPrefs::Get(browser_context)`) or `BrowserContext` instead.
+- Components that also target iOS must have **zero `//content` dependencies** in their `core/` subdirectory, or use a layered structure (`core/` + `content/`).
+
+### brave/browser/
+
+`brave/browser/` is the embedder layer — it may depend on everything below it, including `brave/components/`. This is where `KeyedServiceFactory` implementations live, where components are wired together, and where profile-specific logic belongs.
+
+### iOS-Compatible Layered Components
+
+For components that must build on both iOS and desktop, Brave uses a split directory convention:
+
+```text
+components/brave_shields/
+├── core/          # iOS-compatible: no //content dependencies
+│   ├── browser/   # Browser-process logic (no content types)
+│   ├── common/    # Shared across processes
+│   └── test/
+└── content/       # Content-layer integration (WebContents, etc.)
+    ├── browser/   # Browser-process code using content types
+    └── test/
+```
+
+The `core/` subtree never imports `//content` or anything under `content/`. iOS builds only pull in `core/`. Business logic lives in `core/`; WebContents glue lives in `content/`.
+
+## Key Architectural Patterns
+
+### Pass the Most Specific Dependency
+
+Always pass the narrowest object a function actually needs, not a broad "bag of stuff":
+
+```cpp
+// ❌ WRONG — passing Profile when only prefs are needed
+void MyComponent::Init(Profile* profile) {
+  enabled_ = profile->GetPrefs()->GetBoolean(kMyPref);
+}
+
+// ✅ CORRECT — pass only what's needed
+void MyComponent::Init(PrefService* prefs) {
+  enabled_ = prefs->GetBoolean(kMyPref);
+}
+```
+
+Common substitutions:
+
+| Instead of | Prefer |
+|---|---|
+| `Profile*` | `PrefService*` (when only prefs are needed) |
+| `Profile*` | `BrowserContext*` (in components) |
+| `Profile*` | The specific service you fetch (e.g. `ExtensionSystem*`) |
+| `BrowserContext*` | `scoped_refptr<URLLoaderFactory>` (when only network is needed) |
+
+### Abstract Base Classes to Cross Layer Boundaries
+
+When browser-layer behaviour genuinely needs to be accessible from a component, create an abstract interface in the component layer and implement it in the browser layer:
+
+```cpp
+// ✅ In components/ — abstract interface (no browser dependency)
+class BraveOmniboxClient {
+ public:
+  virtual bool IsAutocompleteEnabled() = 0;
+};
+
+// ✅ In browser/ — concrete implementation
+class BraveOmniboxClientImpl : public BraveOmniboxClient {
+  bool IsAutocompleteEnabled() override { ... }
+};
+```
+
+The component depends only on the abstract type; the browser supplies the concrete implementation.
+
+### Internal Feature Guards Over External `#ifdef`
+
+When a feature can be disabled, the factory or service should handle the disabled state internally rather than scattering `#ifdef` guards across every call site:
+
+```cpp
+// ❌ WRONG — ifdef guards scattered everywhere
+#if BUILDFLAG(BRAVE_REWARDS_ENABLED)
+  auto* rewards_service = RewardsServiceFactory::GetForProfile(profile);
+  rewards_service->DoSomething();
+#endif
+
+// ✅ CORRECT — factory returns null when disabled; caller handles it
+auto* rewards_service = RewardsServiceFactory::GetForProfile(profile);
+if (rewards_service) {
+  rewards_service->DoSomething();
+}
+```
+
+### Feature Scope Must Match Ownership Primitive
+
+Every feature must be scoped to exactly one of four ownership primitives. Choose the narrowest scope that fits:
+
+| Scope | Owner | Examples |
+|---|---|---|
+| **Tab** | `BraveTabFeatures` | Find-in-page, print preview, page actions |
+| **Browser Window** | `BrowserWindowFeatures` | Omnibox, bookmarks bar, vertical tabs |
+| **Profile** | `BrowserContextKeyedServiceFactory` | Rewards, Wallet, sync services |
+| **Global** | `GlobalFeatures` | Process-wide features spanning profiles |
+
+Tab-scoped features must never store browser-window state (tabs can move between windows). Browser-window features must never store profile state.
+
+### `common/` Directory Rules
+
+The `common/` subdirectory is compiled into **every** process that links the component — browser, renderer, and utility. Therefore:
+
+- `common/` deps must be safe for every process: `//base`, mojom, and shared structs only.
+- Never put `PrefService`, `BrowserContext`, `Profile`, or `g_browser_process` in `common/`.
+- Browser-process-only helpers belong in `browser/`, not `common/`.
+
+### Factory Patterns
+
+<Accordion title="Use DependsOn for Factory Dependencies">
+  If your `KeyedServiceFactory` depends on other services, declare it with `DependsOn` to ensure proper initialization order:
+
+  ```cpp
+  MyServiceFactory::MyServiceFactory()
+      : BrowserContextKeyedServiceFactory(...) {
+    DependsOn(RewardsServiceFactory::GetInstance());
+    DependsOn(AdsServiceFactory::GetInstance());
+  }
+  ```
+</Accordion>
+
+<Accordion title="Return null for Incognito Profiles">
+  If a service should not run in incognito, return `nullptr` from `GetBrowserContextToUse`:
+
+  ```cpp
+  content::BrowserContext* GetBrowserContextToUse(
+      content::BrowserContext* context) const override {
+    if (context->IsOffTheRecord())
+      return nullptr;
+    return context;
+  }
+  ```
+</Accordion>
+
+<Accordion title="Factory Return Value Must Be Stable">
+  A `KeyedServiceFactory` may only return `nullptr` based on attributes that are **fixed for the entire browser session**: profile type, buildflags, and feature flags. Never gate factory creation on a user-toggleable pref — if the pref changes, the service would be absent until browser restart.
+
+  ```cpp
+  // ❌ WRONG — pref toggle requires a restart
+  if (!prefs->GetBoolean(kBraveWalletEnabledPref))
+    return nullptr;
+
+  // ✅ CORRECT — always build; the service reads the pref at runtime
+  return std::make_unique<BraveWalletService>(
+      user_prefs::UserPrefs::Get(context), ...);
+  ```
+</Accordion>
+
+## File Organization
+
+Group files by component, not by platform:
+
+```text
+# ❌ WRONG
+brave/browser/android/rewards/brave_rewards_native_worker.cc
+
+# ✅ CORRECT — mirrors Chromium patterns like chrome/browser/history/android/
+brave/browser/brave_rewards/android/brave_rewards_native_worker.cc
+```
+
+GN `source_set` names should match their directory name so dependency paths are predictable:
+
+```gn
+# In brave/components/brave_referrals/browser/BUILD.gn
+source_set("browser") { ... }
+# Referenced as //brave/components/brave_referrals/browser
+```

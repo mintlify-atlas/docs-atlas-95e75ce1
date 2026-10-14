@@ -1,0 +1,139 @@
+---
+title: "Building Brave: Component, Release, and Debug Configurations"
+sidebarTitle: "Build"
+description: "How to build Brave Core with pnpm run build, covering Component, Release, Static, and Debug configurations plus Android and iOS specifics."
+---
+
+After initializing your checkout with `pnpm run init`, you are ready to compile. Brave Core exposes its build system through `pnpm run build`, a Node.js wrapper that invokes Chromium's `gn` and `ninja` tools under the hood. The wrapper handles passing the right GN arguments for each configuration so you don't have to manage them manually.
+
+<Note>
+  The build will take a while to complete. Depending on your processor and available memory, a full Release build can take anywhere from one to several hours on the first run. Incremental builds after small changes are much faster.
+</Note>
+
+## Build Configurations
+
+Brave Core supports four named build configurations. The default is `Component`.
+
+<Tabs>
+  <Tab title="Component (default)">
+    **Component** is the standard development configuration. It compiles the browser as a large number of small shared libraries that are loaded at runtime, which makes incremental rebuilds very fast — only the libraries affected by your change need to be relinked. This is the configuration you should use for most day-to-day development.
+
+    ```bash
+    # Default — equivalent to pnpm run build Component
+    pnpm run build
+    ```
+
+    Component builds are faster to produce but start slightly more slowly than a Release build because the OS must load many shared libraries. They also include more DCHECK assertions, making bugs easier to catch during development.
+  </Tab>
+  <Tab title="Release">
+    **Release** produces an optimized, statically linked binary suitable for distribution. It enables LTO (Link Time Optimization) and the Gold LLVM plugin on Linux, which significantly increases build time and peak RAM usage compared to Component.
+
+    ```bash
+    pnpm run build Release
+    ```
+
+    Use Release builds when you need to profile performance, test startup time, or produce an artifact that mirrors what end users receive.
+
+    <Warning>
+      Running a Release build on Linux with the Gold LLVM plugin can consume 30+ GB of RAM during the link phase. Ensure your machine has sufficient memory or configure a swap file before attempting a Release build.
+    </Warning>
+  </Tab>
+  <Tab title="Static">
+    **Static** is similar to Release but links everything statically, producing a single large executable. It takes longer to build than Release but starts faster at runtime because there are no shared-library loading delays.
+
+    ```bash
+    pnpm run build Static
+    ```
+
+    Static builds are useful for performance benchmarking in environments where startup time matters, or for distribution scenarios that benefit from a self-contained binary.
+  </Tab>
+  <Tab title="Debug">
+    **Debug** is a Component build with `is_debug=true`. It disables most compiler optimizations and adds full symbol information, which makes the debugger experience substantially better but produces a very large binary and significantly slower runtime performance.
+
+    ```bash
+    pnpm run build Debug
+    ```
+
+    Use Debug when you need to step through code with a debugger or are chasing a hard-to-reproduce crash. Note that many Chromium performance-sensitive paths behave differently under debug optimizations.
+  </Tab>
+</Tabs>
+
+## All Build Commands at a Glance
+
+<CodeGroup>
+  ```bash Desktop
+  # Component build (default, fastest incremental)
+  pnpm run build
+
+  # Release build (optimized, slow to build)
+  pnpm run build Release
+
+  # Static build (statically linked, fast startup)
+  pnpm run build Static
+
+  # Debug build (Component + is_debug=true)
+  pnpm run build Debug
+  ```
+
+  ```bash Android
+  # Android Component build targeting ARM (32-bit)
+  pnpm run build --target_os=android --target_arch=arm
+
+  # Android Release build targeting ARM64
+  pnpm run build Release --target_os=android --target_arch=arm64
+
+  # Other supported target_arch values: x86, x64
+  ```
+
+  ```bash iOS
+  # iOS builds use the Xcode project directly.
+  # Open the project in Xcode:
+  pnpm run ios_bootstrap --open_xcodeproj
+
+  # Or open the project manually:
+  open ios/brave-ios/App/Client.xcodeproj
+  ```
+</CodeGroup>
+
+## Android Builds
+
+Android targets use the same `pnpm run build` command but require `--target_os=android` and a `--target_arch` flag. The four supported architectures are:
+
+| Flag | ABI | Notes |
+|---|---|---|
+| `--target_arch=arm` | `armeabi-v7a` | 32-bit ARM; most widely compatible |
+| `--target_arch=arm64` | `arm64-v8a` | 64-bit ARM; required for modern devices |
+| `--target_arch=x86` | `x86` | 32-bit x86; mainly used for emulators |
+| `--target_arch=x64` | `x86_64` | 64-bit x86; used for modern emulators |
+
+The Android SDK and NDK are managed by the `init` step and do not need to be installed separately.
+
+## iOS Builds
+
+iOS builds do **not** use `pnpm run build`. Instead, the Brave iOS browser is built through the Xcode project located at `ios/brave-ios/App`. You can open it directly or use the convenience script:
+
+```bash
+# Opens the Xcode project and configures it for local builds
+pnpm run ios_bootstrap --open_xcodeproj
+```
+
+Refer to the [iOS Development Environment](https://github.com/brave/brave-browser/wiki/iOS-Development-Environment#Building) wiki page for signing, provisioning, and device deployment details.
+
+## Build Output Locations
+
+Build artifacts are placed under `src/out/` relative to your project root:
+
+```text
+src/out/
+├── Component/     # Component build output
+├── Release/       # Release build output
+├── Static/        # Static build output
+└── Debug/         # Debug build output
+```
+
+The main browser executable is:
+- **Linux:** `src/out/<config>/brave`
+- **macOS:** `src/out/<config>/Brave Browser.app`
+- **Windows:** `src/out/<config>/brave.exe`
+
+Once the build completes, continue to [Run and Update](/getting-started/run-and-update) to start the browser and learn how to keep your checkout up to date.

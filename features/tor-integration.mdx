@@ -1,0 +1,206 @@
+---
+title: "Tor Private Windows: Built-In Anonymity in Brave"
+sidebarTitle: "Tor Integration"
+description: "How Brave's Tor Private Windows route traffic through the Tor network using a separate browser profile, onion routing, and a bundled Tor client binary."
+---
+
+Brave ships a fully integrated Tor client on desktop platforms, giving users access to onion routing without installing a separate application. A **Tor Private Window** is a distinct browser profile — isolated from your normal and private windows — in which every network request is routed through the Tor anonymity network. The Tor binary is delivered and updated through Brave's component updater infrastructure, and its lifecycle is managed by a set of C++ service classes in the `brave_shields/tor` component.
+
+<Note>
+Tor Private Windows are available on **desktop platforms only** (Windows, macOS, Linux). The feature is not available on Android or iOS. If `tor.tor_disabled` is set to `true` in local state prefs, the Tor window option is hidden.
+</Note>
+
+## How Tor Windows Work
+
+<Steps>
+  <Step title="A separate Profile is created">
+    When the user opens a Tor Private Window, `TorProfileManager::SwitchToTorProfile` creates (or re-uses) a dedicated `Profile` object for Tor. Each regular profile can have at most one Tor profile associated with it. Tor profile preferences are initialised by `InitTorProfileUserPrefs`, which sets privacy-hardened defaults for that profile.
+  </Step>
+  <Step title="The Tor process is launched">
+    `TorProfileServiceImpl` is a `KeyedService` tied to the Tor profile. When it initialises, it calls `LaunchTor()`, which delegates to the singleton `TorLauncherFactory`. The factory launches the bundled Tor binary via a Mojo service interface (`tor::mojom::TorLauncher`) and begins polling `TorControl` for connection events.
+  </Step>
+  <Step title="Navigation is deferred until Tor connects">
+    `TorNavigationThrottle` intercepts the initial navigation in the Tor profile. It defers the request (`DEFER`) until `OnTorCircuitEstablished(true)` is fired by the `TorLauncherObserver` interface, then resumes. This prevents any request from leaking before the Tor circuit is ready.
+  </Step>
+  <Step title="All requests proxy through Tor's SOCKS port">
+    `TorProfileServiceImpl::CreateProxyConfigService` returns a `net::ProxyConfigServiceTor` that routes all network requests through the local SOCKS proxy exposed by the Tor process. The SOCKS URI is obtained from `TorLauncherFactory::GetTorProxyURI()`.
+  </Step>
+  <Step title="New circuits can be requested per tab">
+    Users can request a new Tor circuit (and thus a new exit node) for a specific tab via `TorProfileService::SetNewTorCircuit`. This calls into `TorControl` to signal Tor to establish a fresh circuit for subsequent connections from that tab's origin.
+  </Step>
+</Steps>
+
+## Component Architecture
+
+The Tor integration is split between two directories:
+
+```
+components/tor/          — platform-independent tor component logic
+browser/tor/             — browser-layer factories and profile management
+```
+
+### components/tor/
+
+| File | Responsibility |
+|---|---|
+| `tor_profile_service.h` / `tor_profile_service_impl.h` | Abstract service + implementation; `KeyedService` tied to the Tor profile. Owns the connection to `TorLauncherFactory` and implements `TorLauncherObserver`. |
+| `tor_launcher_factory.h` | Browser-process singleton that owns the Mojo remote to the out-of-process Tor launcher, manages process lifecycle (launch, crash, relaunch), and communicates with `TorControl`. |
+| `tor_control.h` | Implements the Tor control protocol: connects to Tor's control port, authenticates with a cookie, sends commands, and parses asynchronous events into `TorControlEvent` values. |
+| `brave_tor_client_updater.h` | `BraveComponent` subclass that registers with the component updater, downloads the Tor client binary, and notifies observers via `OnExecutableReady`. |
+| `brave_tor_pluggable_transport_updater.h` | Downloads optional pluggable transport binaries (Snowflake, obfs4) for users who need to bypass Tor blocking. |
+| `tor_navigation_throttle.h` | `NavigationThrottle` that defers navigations in a Tor profile until the circuit is established. |
+| `onion_location_navigation_throttle.h` | Detects `Onion-Location` response headers on clearnet sites and can automatically redirect or prompt the user to open the `.onion` equivalent in a Tor window. |
+| `tor_tab_helper.h` | `WebContentsObserver` attached to tabs in the Tor profile; reloads the tab on circuit changes. |
+| `pref_names.h` | Preference keys controlling Tor behaviour (see [Preferences](#preferences)). |
+
+### browser/tor/
+
+| File | Responsibility |
+|---|---|
+| `tor_profile_manager.h` | Singleton that maps regular profiles to their associated Tor profiles, creates them on demand via `SwitchToTorProfile`, and closes all Tor windows when requested. |
+| `tor_profile_service_factory.h` | `BrowserContextKeyedServiceFactory` that creates and returns the `TorProfileService` for a given browser context. |
+
+## Key Classes
+
+### TorProfileService
+
+```cpp
+// components/tor/tor_profile_service.h
+class TorProfileService : public KeyedService {
+ public:
+  virtual void RegisterTorClientUpdater() = 0;
+  virtual void UnregisterTorClientUpdater() = 0;
+  virtual void SetNewTorCircuit(content::WebContents* web_contents) = 0;
+  virtual std::unique_ptr<net::ProxyConfigService>
+      CreateProxyConfigService() = 0;
+  virtual bool IsTorConnected() = 0;
+  virtual void KillTor() = 0;
+};
+```
+
+`TorProfileService` is abstract. `TorProfileServiceImpl` provides the full implementation, observing both `BraveTorClientUpdater` (to know when the executable is ready) and `TorLauncherFactory` (to track connection state).
+
+### TorLauncherFactory
+
+```cpp
+// components/tor/tor_launcher_factory.h
+class TorLauncherFactory : public tor::TorControl::Delegate {
+ public:
+  static TorLauncherFactory* GetInstance();
+
+  virtual void LaunchTorProcess(const tor::mojom::TorConfig& config);
+  virtual void KillTorProcess();
+  virtual bool IsTorConnected() const;
+  virtual std::string GetTorProxyURI() const;
+  virtual std::string GetTorVersion() const;
+  virtual void SetupPluggableTransport(const base::FilePath& snowflake,
+                                       const base::FilePath& obfs4);
+  virtual void SetupBridges(tor::BridgesConfig bridges_config);
+
+  void AddObserver(TorLauncherObserver* observer);
+  void RemoveObserver(TorLauncherObserver* observer);
+};
+```
+
+`TorLauncherFactory` is a browser-process singleton (`base::NoDestructor`). It uses a Mojo remote to an out-of-process `tor::mojom::TorLauncher` service, isolating the Tor binary from the main browser process. After launch, it authenticates with Tor's control port via `TorControl` and receives bootstrapping progress events to determine when a circuit is ready.
+
+If the Tor process crashes, `OnTorLauncherCrashed` / `OnTorCrashed` trigger `RelaunchTor()` with an exponential backoff delay via `DelayedRelaunchTor()`.
+
+### TorNavigationThrottle
+
+```cpp
+// components/tor/tor_navigation_throttle.h
+class TorNavigationThrottle : public content::NavigationThrottle,
+                              public TorLauncherObserver {
+ public:
+  ThrottleCheckResult WillStartRequest() override;
+  ThrottleCheckResult WillRedirectRequest() override;
+
+ private:
+  void OnTorCircuitEstablished(bool result) override;
+  bool resume_pending_ = false;
+};
+```
+
+On `WillStartRequest`, the throttle checks `TorLauncherFactory::IsTorConnected()`. If Tor is not yet connected, it stores `resume_pending_ = true` and returns `DEFER`. When `OnTorCircuitEstablished(true)` fires, it calls `Resume()`. This guarantees no request leaves the browser before Tor is ready.
+
+### TorProfileManager
+
+```cpp
+// browser/tor/tor_profile_manager.h
+class TorProfileManager : public ProfileObserver {
+ public:
+  static TorProfileManager& GetInstance();
+  static BrowserWindowInterface* SwitchToTorProfile(Profile* original_profile);
+  static BrowserWindowInterface* SwitchToTorProfile(
+      Profile* original_profile,
+      const GURL& url,
+      const std::optional<url::Origin>& initiator_origin);
+  static void CloseTorProfileWindows(Profile* tor_profile);
+  Profile* GetTorProfile(Profile* original_profile);
+  void CloseAllTorWindows();
+};
+```
+
+The manager maintains a `flat_map<string, Profile*>` from regular profile paths to their Tor counterparts. One regular profile can only ever have one Tor profile. When the source profile is destroyed (`OnProfileWillBeDestroyed`), the associated Tor profile is torn down automatically.
+
+## Onion Location Support
+
+When a clearnet website includes an `Onion-Location` HTTP response header pointing to its `.onion` equivalent, `OnionLocationNavigationThrottle` intercepts the response and can:
+
+- **Auto-redirect** the user to the `.onion` URL in the current (Tor) tab, if `kAutoOnionRedirect` is enabled.
+- **Block `.onion` access** in non-Tor windows if `kOnionOnlyInTorWindows` is enabled, redirecting the user to open the URL in a Tor window instead.
+
+```cpp
+// components/tor/onion_location_navigation_throttle.h
+class OnionLocationNavigationThrottle : public content::NavigationThrottle {
+ public:
+  static void MaybeCreateAndAdd(content::NavigationThrottleRegistry& registry,
+                                bool is_tor_disabled,
+                                bool is_tor_profile,
+                                bool onion_only_in_tor_windows);
+  ThrottleCheckResult WillProcessResponse() override;
+  ThrottleCheckResult WillStartRequest() override;
+  ThrottleCheckResult WillRedirectRequest() override;
+};
+```
+
+## Preferences
+
+Tor behaviour is controlled by the following preference keys defined in `pref_names.h`:
+
+| Preference | Key | Default | Description |
+|---|---|---|---|
+| Tor disabled | `tor.tor_disabled` | `false` | Hides the Tor window option entirely |
+| Bridges config | `tor.bridges` | — | Stores the active bridge configuration |
+| Auto-onion redirect | `tor.auto_onion_location` | `false` | Automatically redirects to `.onion` when `Onion-Location` header is present |
+| Onion only in Tor | `tor.onion_only_in_tor_windows` | `false` | Blocks `.onion` navigation in non-Tor windows |
+| Builtin bridges request time | `tor.builtin_bridges_request_time` | — | Timestamp of the last built-in bridge list refresh |
+
+## Pluggable Transports
+
+In regions where Tor is actively blocked, Brave supports **pluggable transports** — protocols that disguise Tor traffic as other types of traffic. The `BraveTorPluggableTransportUpdater` component downloads the Snowflake and obfs4proxy binaries alongside the Tor client binary. `TorLauncherFactory::SetupPluggableTransport` configures the Tor process to use them.
+
+Bridge configuration is stored in the `tor.bridges` pref and applied via `TorLauncherFactory::SetupBridges`.
+
+## Security Model
+
+<Accordion title="Traffic isolation">
+All Tor profile traffic is proxied through Tor's SOCKS port. No DNS queries, no HTTP requests, and no WebSocket connections escape the proxy. The `net::ProxyConfigServiceTor` returned by `CreateProxyConfigService` enforces this at the network layer for every request originating from the Tor profile.
+</Accordion>
+
+<Accordion title="Profile isolation">
+The Tor profile is a fully separate `Profile` from the user's regular browsing profile. Cookies, storage, cache, and history are not shared. This means sites cannot use login state or cached data from your regular browsing session to identify you in a Tor window.
+</Accordion>
+
+<Accordion title="Process isolation">
+The Tor binary runs as an out-of-process component via a Mojo service interface (`tor::mojom::TorLauncher`). A crash in the Tor process does not crash the browser. `TorLauncherFactory` detects the crash and relaunches the process automatically.
+</Accordion>
+
+<Accordion title="Circuit renewal">
+Users can request a new Tor circuit at any time via `TorProfileService::SetNewTorCircuit`. A new circuit means a new path through the Tor relay network and (typically) a new exit node, making it harder to link two sets of requests to the same user.
+</Accordion>
+
+<Warning>
+Tor Private Windows protect your network-level identity but do not prevent browser fingerprinting via JavaScript APIs. For maximum fingerprinting resistance, Brave's Shields farbling protections remain active in Tor windows. However, users should be aware that sophisticated fingerprinting attacks may still work. For strong anonymity, consider the Tor Browser Bundle, which applies additional hardening at the browser level.
+</Warning>

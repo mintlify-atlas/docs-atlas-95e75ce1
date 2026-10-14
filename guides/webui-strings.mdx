@@ -1,0 +1,147 @@
+---
+title: "Adding and Managing Strings in Brave WebUI"
+sidebarTitle: "WebUI Strings"
+description: "How Brave's .grdp string pipeline works: adding strings with formatter_data, auto-generated TypeScript enums, the global S alias, and localization in upstream Chromium UIs."
+---
+
+Brave extends the standard Chromium `grit` localization tool with the ability to automatically generate TypeScript bindings and enums from `.grdp` string definitions. This removes error-prone hard-coded string-key strings from UI code and replaces them with type-safe TypeScript enum values that the compiler can verify at build time.
+
+## How the Pipeline Works
+
+At a high level, adding a localized string to a Brave WebUI involves three layers:
+
+1. **`.grdp` file** — the string definition, tagged with `formatter_data="webui=MyUi"` to opt it into auto-generation.
+2. **C++ source file** — the WebUI handler that registers all strings for a given page in one call instead of individually.
+3. **TypeScript entry point and component files** — import the generated enum and call `getLocale()` with enum values rather than raw string keys.
+
+## Step 1: Add the String to a `.grdp` File
+
+Open the relevant `.grdp` file (for example `components/brave_new_tab_ui/resources/my_strings.grdp`) and add the `formatter_data="webui=MyUi"` attribute to the message element. The `MyUi` value becomes the namespace for the generated enum.
+
+```diff
+- <message name="IDS_MY_UI_MESSAGE_NAME">
++ <message name="IDS_MY_UI_MESSAGE_NAME" formatter_data="webui=MyUi">
+    Message name
+  </message>
+```
+
+<Note>
+The `webui=` value is used to namespace the generated enum and the corresponding C++ array name. All strings sharing the same `webui=` value are grouped together in the same generated bindings.
+</Note>
+
+## Step 2: Update the C++ WebUI Handler
+
+After running a build (or `grit`), the generated header `components/grit/brave_components_webui_strings.h` will contain a `kMyUiStrings` array. Replace individual `AddLocalizedString()` calls with a single `AddLocalizedStrings()` call:
+
+```cpp
+// my_ui.cc
+#include "components/grit/brave_components_webui_strings.h"
+
+MyUi::MyUi(WebUI* ui) {
+  content::WebUIDataSource* source = ...;
+
+  // Before: one call per string
+  // source->AddLocalizedString("messageName", IDS_MY_UI_MESSAGE_NAME);
+
+  // After: one call registers all strings tagged webui=MyUi
+  source->AddLocalizedStrings(webui::kMyUiStrings);
+}
+```
+
+This pattern scales naturally — adding more strings to the `.grdp` file automatically includes them in the `kMyUiStrings` array without requiring changes to the C++ handler.
+
+## Step 3: Import the Enum in TypeScript
+
+The grit generation also produces a TypeScript file at `gen/components/grit/brave_components_webui_strings.ts`. You can import the enum directly in any component:
+
+```diff
+// my_component.tsx
++ import { MyUiStrings } from 'gen/components/grit/brave_components_webui_strings'
+
+  export default function Component() {
+    return (
+      <div>
+-       {getLocale('messageName')}
++       {getLocale(MyUiStrings.MY_UI_MESSAGE_NAME)}
+      </div>
+    )
+  }
+```
+
+## Step 4: Set Up the Global `S` Alias (Once per WebUI)
+
+Importing the full enum in every component is verbose. Brave uses a convention of aliasing all string enums into a global `Strings` interface, making the enum available as `S.MY_UI_MESSAGE_NAME` from any file in the WebUI without an import.
+
+This boilerplate needs to be set up only once per WebUI page:
+
+<Steps>
+  <Step title="Create strings.ts">
+    Create a `strings.ts` file in your WebUI's resources directory:
+
+    ```ts
+    // components/my_ui/resources/strings.ts
+    import '$web-common/strings'
+
+    import { MyUiStrings } from 'gen/components/grit/brave_components_webui_strings'
+
+    declare global {
+      interface Strings {
+        MyUiStrings: typeof MyUiStrings
+      }
+    }
+    ```
+  </Step>
+  <Step title="Import from the entry point">
+    Import `strings.ts` from the page's main entry point. This must be a side-effect import so the global augmentation runs:
+
+    ```diff
+    // my_ui.tsx (entry point)
+    + import './strings'
+      import React from 'react'
+      // ... rest of entry point
+    ```
+  </Step>
+  <Step title="Use S in any component">
+    Once the global augmentation is registered, any file in the WebUI can use the `S` shorthand without an import:
+
+    ```diff
+    // my_component.tsx
+      export default function Component() {
+        return (
+          <div>
+    -       {getLocale('messageName')}
+    +       {getLocale(S.MY_UI_MESSAGE_NAME)}
+          </div>
+        )
+      }
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+For a large-scale example of converting string keys to `S.*` enum values, see [brave-core PR #29505](https://github.com/brave/brave-core/pull/29505) which migrated AIChat strings.
+</Tip>
+
+## Using Strings in Upstream Chromium UIs
+
+The same system works for Brave strings used inside upstream Chromium WebUI pages (Lit/Polymer), but the integration is slightly different because upstream's build pipeline only has a mechanism for including generated files via the mojo file list.
+
+To add a Brave-generated strings file to an upstream WebUI:
+
+1. Add the generated file (`gen/components/grit/brave_components_webui_strings.ts`) to the list of mojo files in the upstream page's build configuration.
+2. Everything else — the `formatter_data` attribute, C++ `AddLocalizedStrings`, and TypeScript `getLocale(S.MY_UI_MESSAGE_NAME)` calls — works identically to Brave-owned WebUI pages.
+
+## Storybook Support
+
+Storybook automatically picks up the generated string bindings. The Storybook build runs grit generation as part of the standard setup, so `S.*` values are available in stories without any extra configuration. This means you can use real `getLocale()` calls in stories rather than hard-coding placeholder text.
+
+## String ID Naming Convention
+
+String IDs in `.grdp` files follow a `IDS_<UI_NAMESPACE>_<DESCRIPTION>` pattern in SCREAMING_SNAKE_CASE. The generated TypeScript enum drops the `IDS_` prefix, so `IDS_MY_UI_MESSAGE_NAME` becomes `MyUiStrings.MY_UI_MESSAGE_NAME` in TypeScript.
+
+| Layer | Format | Example |
+|-------|--------|---------|
+| `.grdp` message name | `IDS_<NAMESPACE>_<DESC>` | `IDS_MY_UI_WELCOME_TITLE` |
+| C++ macro | Same as `.grdp` | `IDS_MY_UI_WELCOME_TITLE` |
+| TypeScript enum value | Drop `IDS_` prefix | `MyUiStrings.MY_UI_WELCOME_TITLE` |
+| Global alias | `S.*` | `S.MY_UI_WELCOME_TITLE` |

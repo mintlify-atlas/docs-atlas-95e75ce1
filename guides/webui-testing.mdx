@@ -1,0 +1,190 @@
+---
+title: "Testing Brave WebUI with Jest and TypeScript"
+sidebarTitle: "WebUI Testing"
+description: "How to write, organize, and run Jest unit tests for Brave's React WebUI pages: test file conventions, mojom mocking patterns, Testing Library usage, and watch mode."
+---
+
+Brave's WebUI pages use Jest for frontend unit testing. These tests are conceptually similar to C++ `unit_tests` — they run in an isolated environment with mocked dependencies and execute very quickly, without needing a browser process. They are distinct from upstream Chromium's Mocha-based `browser_tests`, which run inside a full browser and are better suited for end-to-end verification of Lit/Polymer pages.
+
+## Test File Conventions
+
+Jest tests live as sibling files to the modules they test. Name the test file after the file under test with a `.test.ts` or `.test.tsx` suffix:
+
+```
+components/
+  brave_new_tab_ui/
+    resources/
+      page/
+        components/
+          ItemList.tsx           ← component
+          ItemList.test.tsx      ← its Jest test
+        state/
+          my_api.ts              ← API factory
+          my_api.test.ts         ← its Jest test
+```
+
+A minimal test file looks like this:
+
+```ts
+// ItemList.test.tsx
+import { add } from './your-file'
+
+describe('your file should work the way I want', () => {
+  it('should be able to add things', () => {
+    expect(add(1, 2)).toBe(3)
+  })
+})
+```
+
+## Running Tests
+
+<Steps>
+  <Step title="Run the full test suite">
+    Run all `*.test.ts(x)` files across the entire repo:
+
+    ```sh
+    pnpm run test-unit
+    ```
+  </Step>
+  <Step title="Run a filtered subset">
+    Pass a test-name substring to `-t` to run only matching tests. This is much faster during development:
+
+    ```sh
+    pnpm run test-unit -t "should be able to add"
+    ```
+  </Step>
+  <Step title="Filter by file path">
+    Pass a path glob after the command to limit which test files Jest loads:
+
+    ```sh
+    pnpm run test-unit components/brave_new_tab_ui
+    ```
+  </Step>
+  <Step title="Enable watch mode">
+    Watch mode re-runs affected tests every time you save a file, giving you an instant feedback loop:
+
+    ```sh
+    pnpm run test-unit --watch
+    ```
+  </Step>
+</Steps>
+
+## Writing React Component Tests with Testing Library
+
+Brave uses [Testing Library](https://testing-library.com/) for React component tests. Testing Library renders components into a JSDOM environment, letting you query by accessible role, text, or label rather than by implementation details like class names.
+
+```tsx
+// ItemList.test.tsx
+import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { ItemList } from './ItemList'
+import { createMockService } from '../api/mock_service'
+import { MyFeatureProvider } from '../state/my_feature_context'
+
+const SAMPLE_ITEMS = [
+  { id: '1', name: 'First item' },
+  { id: '2', name: 'Second item' },
+]
+
+function renderWithProvider(ui: React.ReactElement) {
+  const mockService = createMockService({
+    getItems: () => Promise.resolve({ items: SAMPLE_ITEMS }),
+  })
+  return render(
+    <MyFeatureProvider api={mockService}>{ui}</MyFeatureProvider>
+  )
+}
+
+describe('ItemList', () => {
+  it('renders a list of items', async () => {
+    renderWithProvider(<ItemList />)
+    expect(await screen.findByText('First item')).toBeInTheDocument()
+    expect(screen.getByText('Second item')).toBeInTheDocument()
+  })
+
+  it('shows a loading state before data arrives', () => {
+    renderWithProvider(<ItemList />)
+    expect(screen.getByRole('progressbar')).toBeInTheDocument()
+  })
+})
+```
+
+<Tip>
+Use `screen.findBy*` (the async variant) for elements that appear after data loads. Use `screen.getBy*` for elements that must already exist at render time.
+</Tip>
+
+## Mocking Mojom Interfaces
+
+Mojom-backed APIs should never be called directly in unit tests. Instead, create a mock service factory (see [WebUI Frontend — Mocking](./webui-frontend#mocking-for-tests-and-storybook)) and pass it as the API source.
+
+For tests that exercise the API layer itself (not just the UI), you can provide per-test override functions directly:
+
+```ts
+// my_api.test.ts
+import { createMyApi } from './my_api'
+import { createMockService } from './mock_service'
+
+describe('createMyApi', () => {
+  it('exposes items from the remote', async () => {
+    const items = [{ id: '1', name: 'Test' }]
+    const service = createMockService({
+      getItems: () => Promise.resolve({ items }),
+    })
+    const api = createMyApi(service)
+
+    // Wait for the initial query to complete
+    await api.getItems.fetch()
+    expect(api.getItems.getQueryData()).toEqual(items)
+  })
+
+  it('updates the cache when an observer fires', async () => {
+    const service = createMockService()
+    const api = createMyApi(service)
+
+    const updated = [{ id: '1', name: 'Updated' }]
+    api.getItems.update(updated)
+
+    expect(api.getItems.getQueryData()).toEqual(updated)
+  })
+})
+```
+
+## Snapshot Tests
+
+Testing Library's `render` result can be snapshotted to catch unintended rendering changes:
+
+```tsx
+it('matches snapshot', async () => {
+  const { asFragment } = renderWithProvider(<ItemList />)
+  // Wait for async data
+  await screen.findByText('First item')
+  expect(asFragment()).toMatchSnapshot()
+})
+```
+
+<Warning>
+Lit mangler overrides automatically generate their own snapshot tests. Update those with `pnpm run test-unit -t "mangled files should have up to date snapshots" -u` whenever upstream templates change. See [WebUI Overrides — Lit Mangler](./webui-overriding#lit-mangler) for details.
+</Warning>
+
+## Mocha Browser Tests (Upstream UI)
+
+Upstream Chromium also supports Mocha-based `browser_tests` for WebUI pages. These run inside a real browser process and are closer to integration tests. Brave has historically not written many of these, but they are a good choice when working on upstream Lit/Polymer pages where full DOM lifecycle behavior needs verification.
+
+For Mocha browser test documentation, see [Chromium's WebUI testing guide](https://chromium.googlesource.com/chromium/src/+/main/docs/webui/testing_webui.md).
+
+## Additional Resources
+
+<CardGroup cols={2}>
+  <Card title="Jest Documentation" icon="book" href="https://jestjs.io/">
+    Full Jest API reference, configuration options, and mock utilities
+  </Card>
+  <Card title="Testing Library" icon="book-open" href="https://testing-library.com/">
+    React-specific query helpers, user-event simulation, and best practices
+  </Card>
+  <Card title="Running C++ Tests" icon="flask" href="./running-tests">
+    How to run brave_unit_tests, brave_browser_tests, and other C++ suites
+  </Card>
+  <Card title="WebUI Frontend" icon="react" href="./webui-frontend">
+    The createInterfaceApi pattern and mock factory conventions
+  </Card>
+</CardGroup>

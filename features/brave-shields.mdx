@@ -1,0 +1,222 @@
+---
+title: "Brave Shields: Ad Blocking and Privacy Protection"
+sidebarTitle: "Brave Shields"
+description: "How Brave Shields blocks ads, trackers, fingerprinting scripts, and cross-site cookies using the adblock-rust engine and cosmetic filters."
+---
+
+Brave Shields is the built-in content-blocking subsystem that protects users on every page load without requiring any extensions. It intercepts network requests, hides DOM elements, hardens HTTP behaviour, and limits browser fingerprinting — all managed through per-origin content settings stored in `HostContentSettingsMap` and exposed to users through the Shields panel.
+
+## What Shields Blocks
+
+<CardGroup cols={2}>
+  <Card title="Ads & Trackers" icon="ban">
+    Network-level blocking of ad servers and tracking pixels using the adblock-rust engine. The default list uses Brave's own compiled filter list; aggressive mode adds first-party blocking.
+  </Card>
+  <Card title="Cross-Site Cookies" icon="cookie-bite">
+    Third-party cookies are blocked by default. The `shieldsCookiesV3` content setting controls this, with modes for `ALLOW`, `BLOCK`, and `BLOCK_THIRD_PARTY`.
+  </Card>
+  <Card title="Fingerprinting" icon="fingerprint">
+    The `fingerprintingV2` setting gates the Farbling subsystem, which introduces calibrated randomness into canvas, audio, WebGL, font, and screen APIs to make cross-site device identification unreliable.
+  </Card>
+  <Card title="Cosmetic Filtering" icon="eye-slash">
+    CSS selector–based hiding of ad placeholders that survive request blocking. Controlled via the `cosmeticFilteringV2` content setting with `BLOCK` (third-party only) or `BLOCK_THIRD_PARTY` default.
+  </Card>
+  <Card title="HTTPS Upgrades" icon="lock">
+    The `httpsUpgrades` setting drives automatic HTTPS upgrading for navigations, replacing Chromium's HTTPS-First Mode with Brave's own exception-aware service.
+  </Card>
+  <Card title="CNAME Uncloaking" icon="magnifying-glass">
+    DNS-level tracker detection: before a network request is allowed, a CNAME lookup resolves the canonical hostname. If the canonical name is on a known tracker list, the request is blocked.
+  </Card>
+</CardGroup>
+
+## Component Structure
+
+The `brave_shields` component is split into three layers, matching Chromium's layered architecture pattern:
+
+```
+components/brave_shields/
+├── core/
+│   ├── browser/   — platform-independent logic (ad-block service helpers,
+│   │                filter list catalog, farbling, P3A metrics)
+│   └── common/    — shared constants, mojom interfaces, feature flags,
+│                    ControlType enum, content-settings type names
+├── content/
+│   └── browser/   — content-layer classes that depend on //content
+│                    (AdBlockService, AdBlockEngine, subscription manager,
+│                     cosmetic-filter helpers, domain-block page)
+└── ios/           — iOS-specific browser and common overrides
+```
+
+### Core Constants and Settings
+
+Content-setting keys are declared as `constexpr` strings in `brave_shield_constants.h` and map one-to-one to `ContentSettingsType` enum values:
+
+```cpp
+// components/brave_shields/core/common/brave_shield_constants.h
+inline constexpr char kAds[]                = "shieldsAds";
+inline constexpr char kCosmeticFiltering[]  = "cosmeticFilteringV2";
+inline constexpr char kTrackers[]           = "trackers";
+inline constexpr char kHTTPSUpgrades[]      = "httpsUpgrades";
+inline constexpr char kFingerprintingV2[]   = "fingerprintingV2";
+inline constexpr char kBraveShields[]       = "braveShields";
+inline constexpr char kCookies[]            = "shieldsCookiesV3";
+```
+
+The `ControlType` enum defines the four possible states for any blocking dimension:
+
+```cpp
+// components/brave_shields/core/common/brave_shields_settings_values.h
+enum ControlType {
+  ALLOW = 0,
+  BLOCK,
+  BLOCK_THIRD_PARTY,
+  DEFAULT,
+};
+```
+
+Getters and setters for each dimension are free functions in `brave_shields_utils.h`:
+
+```cpp
+// Set / get ad-blocking level for a URL
+void SetAdControlType(HostContentSettingsMap* map,
+                      ControlType type,
+                      const GURL& url,
+                      PrefService* local_state = nullptr);
+ControlType GetAdControlType(HostContentSettingsMap* map, const GURL& url);
+
+// Set / get fingerprinting protection level
+void SetFingerprintingControlType(HostContentSettingsMap* map,
+                                  ControlType type,
+                                  const GURL& url,
+                                  PrefService* local_state = nullptr,
+                                  PrefService* profile_state = nullptr);
+ControlType GetFingerprintingControlType(HostContentSettingsMap* map,
+                                         const GURL& url);
+
+// Domain blocking mode (none / 1PES / aggressive)
+DomainBlockingType GetDomainBlockingType(HostContentSettingsMap* map,
+                                         const GURL& url);
+```
+
+## The adblock-rust Engine
+
+Brave's network-level blocking is implemented in Rust and exposed to C++ via CXX bindings. The primary class is `AdBlockEngine` in `content/browser/ad_block_engine.h`:
+
+```cpp
+// components/brave_shields/content/browser/ad_block_engine.h
+class AdBlockEngine {
+ public:
+  // Decide whether to block a network request
+  adblock::BlockerResult ShouldStartRequest(
+      const GURL& url,
+      blink::mojom::ResourceType resource_type,
+      const url::Origin& request_initiator,
+      const std::string& method,
+      bool previously_matched_rule,
+      bool previously_matched_exception,
+      bool previously_matched_important);
+
+  // Cosmetic filtering: CSS selectors to hide on a URL
+  base::DictValue UrlCosmeticResources(const std::string& url);
+  base::ListValue HiddenClassIdSelectors(
+      const std::vector<std::string>& classes,
+      const std::vector<std::string>& ids,
+      const std::vector<std::string>& exceptions);
+
+  // CSP injection directives
+  std::optional<std::string> GetCspDirectives(
+      const GURL& url,
+      blink::mojom::ResourceType resource_type,
+      const url::Origin& first_party_origin,
+      const std::string& method);
+};
+```
+
+`AdBlockEngine` wraps a `rust::Box<adblock::Engine>`, the adblock-rust instance. Two independent engine instances are maintained:
+
+- **Default engine** — Brave's compiled default filter list plus the regional filter catalog.
+- **Additional engine** — User-subscribed filter lists and custom rules managed by `AdBlockSubscriptionServiceManager`.
+
+`AdBlockService` owns both engines via `base::SequenceBound<AdBlockEngineWrapper>`, ensuring all engine calls run on a dedicated background sequence.
+
+## Filter List Providers
+
+Filter list data reaches the engine through a provider chain:
+
+<Steps>
+  <Step title="AdBlockComponentFiltersProvider">
+    Fetches Brave's default compiled DAT file and the filter list catalog component from Chromium's component updater infrastructure. The catalog is described by entries in `adblock-resources/filter_lists/regional.json` and parsed into `FilterListCatalogEntry` objects.
+  </Step>
+  <Step title="AdBlockFiltersProviderManager">
+    Aggregates all active providers — default list, regional lists, user subscriptions, custom rules, and localhost filters — into a single merged `FilterSet` that gets loaded into the Rust engine.
+  </Step>
+  <Step title="AdBlockSubscriptionServiceManager">
+    Manages user-added external filter list URLs. Each subscription is downloaded and cached as a text file, refreshed on a timer (`kSubscriptionDefaultExpiresHours = 7 * 24`), and served as an `AdBlockSubscriptionFiltersProvider`.
+  </Step>
+  <Step title="AdBlockCustomFiltersProvider">
+    Exposes user-entered custom filter rules from the `brave://adblock` settings page directly into the filter pipeline.
+  </Step>
+</Steps>
+
+## Cosmetic Filtering
+
+Cosmetic filters hide ad placeholders that survive request blocking. The `cosmeticFilteringV2` setting accepts the same `ControlType` values; the default is `BLOCK_THIRD_PARTY` (hide elements injected by third-party origins, leave first-party cosmetics alone).
+
+```cpp
+// Default value for cosmetic filtering
+using CosmeticFilteringSetting = traits::BraveShieldsSetting<
+    ContentSettingsType::BRAVE_COSMETIC_FILTERING,
+    ControlType,
+    ControlType::BLOCK_THIRD_PARTY>;
+```
+
+When the renderer loads a page, it queries `AdBlockEngine::UrlCosmeticResources` to obtain the set of CSS selectors that should be hidden. The engine also supports **procedural filters** (extended selector syntax for dynamic hiding) via the `kBraveAdblockProceduralFiltering` feature flag.
+
+## Farbling: Fingerprint Randomisation
+
+Farbling injects per-origin, per-session noise into browser APIs that are commonly used for fingerprinting. It is controlled by the `fingerprintingV2` setting and the `kBraveFarbling` feature flag.
+
+Protected APIs include:
+
+- **Canvas 2D / WebGL** — pixel-level noise added to `getImageData` and similar calls
+- **AudioContext** — slight perturbation of `getFloatFrequencyData` / `getByteFrequencyData`
+- **Navigator** — `hardwareConcurrency`, `deviceMemory`, and plugin lists are randomised
+- **Screen** — `availWidth`, `availHeight`, and `colorDepth` are rounded
+- **Fonts** — available font set is lightly perturbed
+
+The per-session token that seeds the PRNG is derived from a browser-level secret combined with the first-party origin, so the same site always sees the same noise for a given session, which avoids breaking legitimate uses while preventing cross-site correlation.
+
+## Domain Blocking
+
+When the `kBraveDomainBlock` feature is enabled and a full page navigation matches a blocked domain, Brave can show an interstitial rather than silently dropping the request. The `DomainBlockingType` enum governs three modes:
+
+```cpp
+enum class DomainBlockingType {
+  kNone,        // Pass through as-is
+  k1PES,        // Allow navigation but use Ephemeral Storage (1PES)
+  kAggressive,  // Show block interstitial before proceeding
+};
+```
+
+`DomainBlockNavigationThrottle` intercepts `WillStartRequest` and consults `GetDomainBlockingType` to decide whether to defer, redirect, or show the `DomainBlockPage` error page.
+
+## Feature Flags
+
+Key feature flags gating Shields behaviour (declared in `core/common/features.h`):
+
+| Flag | Effect |
+|---|---|
+| `kBraveAdblockCnameUncloaking` | Enables CNAME-based tracker detection |
+| `kBraveAdblockCosmeticFiltering` | Enables CSS cosmetic filter injection |
+| `kBraveAdblockProceduralFiltering` | Enables extended procedural filter syntax |
+| `kBraveAdblockCspRules` | Enables CSP injection from filter lists |
+| `kBraveAdblockDefault1pBlocking` | Enables first-party ad blocking in aggressive mode |
+| `kBraveDomainBlock` | Enables domain-level block interstitial |
+| `kBraveDomainBlock1PES` | Enables ephemeral storage on blocked domains |
+| `kBraveFarbling` | Enables Farbling fingerprint randomisation |
+| `kBraveReduceLanguage` | Reduces `Accept-Language` header entropy |
+| `kAdblockOnlyMode` | Stripped-down blocking mode for compatibility |
+
+<Note>
+Shields settings are stored per-origin in `HostContentSettingsMap`. When a user toggles Shields off for a site, only the `braveShields` content setting is flipped to `ALLOW` for that origin — all other settings remain unchanged and take effect again if Shields is re-enabled.
+</Note>

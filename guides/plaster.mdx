@@ -1,0 +1,396 @@
+---
+title: "Plaster: Semantic Patching Engine for Chromium"
+sidebarTitle: "Plaster"
+description: "Plaster replaces brittle .patch files and viral #define macros with YAML-driven regex and AST rewriters that survive Chromium rebases and communicate intent clearly."
+---
+
+Plaster is Brave Core's semantic patching engine — an experimental but actively used tool that applies targeted changes to upstream Chromium source files through a declarative YAML format. Unlike raw `.patch` files, which anchor on surrounding context lines and break whenever those lines shift, Plaster rewriters anchor on meaningful constructs: function names, class members, enum entries, and import statements. Unlike `#define` macro tricks, Plaster substitutions are scoped to exactly the occurrence they describe and are visible as generated patch files in the repository.
+
+## Why Plaster Exists
+
+The two traditional patching approaches each carry significant maintenance costs:
+
+- **Git patches (`.patch` files)** depend on the surrounding lines present when the patch was authored. When upstream code reformats, moves, or grows new lines nearby, the patch requires manual `--3way` conflict resolution — even if the underlying change is untouched.
+- **Preprocessor `#define` macros** rewrite every occurrence of a symbol across every translation unit that includes the file, often silently rewriting code the author never intended. They are difficult to reason about, a common source of rebase bugs, and create invisible behavior changes that are hard to audit in code review.
+
+Plaster's regex and AST rewriters avoid both problems: they match what they mean, they break loudly when their premise no longer holds, and they produce ordinary `.patch` files that the existing Brave toolchain handles without modification.
+
+## How Plaster Works
+
+Plaster files live under `rewrite/`, use a `.yaml` extension, and mirror the path of the file they target:
+
+| Role | Path |
+|------|------|
+| Plaster file | `brave/rewrite/components/permissions/request_type.h.yaml` |
+| Source file | `components/permissions/request_type.h` |
+| Generated patch | `brave/patches/components-permissions-request_type.h.patch` |
+
+When you run `plaster apply`, Plaster loads the target source from `git` (the canonical source of truth, not disk), applies each substitution cumulatively, writes the result back to the source file, and creates or updates the corresponding patch file. The result is an ordinary patch that the Brave build toolchain applies during `pnpm run apply_patches`, exactly as it would a hand-authored patch.
+
+<Note>
+  Repositories other than Chromium's `src` are supported as long as they are listed in `patches/.repositories.cfg`.
+</Note>
+
+## The YAML File Format
+
+A plaster file is a YAML document with a `substitutions:` list. Each item in the list carries an optional `description:`, an optional `count:`, and exactly one rewriter block.
+
+<CodeGroup>
+
+```yaml Regex substitution (full example)
+# Copyright (c) 2026 The Brave Authors. All rights reserved.
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this file,
+# You can obtain one at https://mozilla.org/MPL/2.0/.
+
+substitutions:
+  - description: |
+      Append Brave-specific entries to `RequestType`
+
+      This plaster is generic enough to guarantee that our entries are always
+      last, and that they also become the new kMaxValue.
+    regex:
+      re_pattern: '(enum class RequestType \{.+?,)(\s+)kMaxValue = \w+'
+      re_flags: [DOTALL]
+      replace: |-
+        \1
+          kWidevine,
+          kBraveEthereum,
+          kBraveSolana,
+          kBraveOpenAIChat,
+          kBraveGoogleSignInPermission,
+          kBraveCardano,
+          kBraveMinValue = kWidevine,
+          kBraveMaxValue = kBraveCardano,
+          kMaxValue = kBraveCardano
+```
+
+```yaml AST rewriter (add_friend)
+substitutions:
+  - description: 'Let the Brave subclass reach private members.'
+    add_friend:
+      class_name: MultiContentsView
+      friend_type: class BraveMultiContentsView
+```
+
+```yaml AST rewriter (preempt_function_impl)
+substitutions:
+  - description: 'Leave DoSomething alone when Brave has the feature off.'
+    preempt_function_impl:
+      function_name: Foo::DoSomething
+      code: |-
+        if (!IsBarEnabled(prefs())) {
+          return;
+        }
+```
+
+```yaml GN rewriter (insert_into_list)
+substitutions:
+  - description: 'Add Brave sources to the browser target.'
+    insert_into_list:
+      target: browser
+      attribute: sources
+      values:
+        - '//brave/browser/brave_feature.cc'
+        - '//brave/browser/brave_feature.h'
+```
+
+</CodeGroup>
+
+### The `count` field
+
+The `count` field controls how many matches a substitution is expected to make:
+
+| Value | Meaning |
+|-------|---------|
+| `1` (default) | Exactly one match; the substitution fails if zero or more-than-one are found |
+| `0` | One or more matches; use only when the number of occurrences is known to vary and every occurrence is safe to substitute |
+| `N` | Exactly N matches |
+
+`count: 1` is the default and does not need to be written out. Any other value must be spelled explicitly and should be accompanied by a comment explaining why.
+
+### YAML scalar tips
+
+Use YAML block scalars for multi-line values:
+- `|` — preserves the trailing newline
+- `|-` — strips the trailing newline (preferred for `replace:` and most `code:` blocks)
+
+Single-quoted YAML strings preserve backslashes literally (`'\s'` stays as two characters, not interpreted by YAML) — use them for `re_pattern:`.
+
+## Available Rewriters
+
+<Accordion title="Text rewriters (all languages)">
+
+| Rewriter | Description |
+|----------|-------------|
+| `regex` | A Python `re.subn` substitution. The default rewriter. |
+| `add_after_line` | Inserts code after a given line. |
+| `add_before_line` | Inserts code before a given line. |
+| `add_after_copyright_notice` | Inserts code immediately after the copyright notice. |
+| `add_at_end_of_the_file` | Appends code at the end of a file. |
+
+</Accordion>
+
+<Accordion title="C++ AST rewriters (cxx namespace)">
+
+| Rewriter | Description |
+|----------|-------------|
+| `make_virtual` | Prepends `virtual` to a C++ method declaration. |
+| `add_friend` | Adds a `friend` declaration to a class's private section. |
+| `drop_final` | Removes `final` from a C++ class declaration. |
+| `preempt_function_impl` | Inserts code at the top of a C++ function body. |
+| `after_function_impl` | Wraps a C++ function body and runs code after it returns. |
+| `rename_class` | Renames a C++ class throughout the file. |
+| `add_to_protected` | Adds a member to a class `protected:` section. |
+| `add_to_public` | Appends a member to a class `public:` section. |
+| `add_enum_entries` | Appends entries to the end of a C++ enum. |
+| `set_feature_flag_default_state` | Sets a `BASE_FEATURE`'s default enabled state. |
+
+</Accordion>
+
+<Accordion title="GN build file rewriters (gn namespace)">
+
+| Rewriter | Description |
+|----------|-------------|
+| `insert_into_list` | Inserts value(s) into a target's list attribute. |
+| `set_attribute` | Sets a target's attribute, creating it if absent. |
+| `remove_attribute` | Removes an attribute from a target. |
+| `add_literal_to_list` | Adds a literal to a target's list attribute (AST). |
+| `append_to_target` | Appends code to the end of a target's body. |
+| `add_import` | Adds an `import()` statement to the top of a GN file. |
+| `add_literal_to_variable` | Appends a literal to a file-scope list variable. |
+| `subtract_literal_from_variable` | Subtracts a literal from a file-scope list variable. |
+
+</Accordion>
+
+<Accordion title="JavaScript / TypeScript rewriters (js / ts namespace)">
+
+| Rewriter | Description |
+|----------|-------------|
+| `set_blink_runtime_enabled_feature_state` | Sets a Blink runtime feature's `base_feature_status`. |
+| `add_import` (ts) | Adds an import to the top of a `.ts` file. |
+| `drop_custom_element_registration` | Removes a WebUI element's `customElements.define` call. |
+
+</Accordion>
+
+## Creating and Applying a Plaster
+
+<Steps>
+
+### Create the plaster YAML file
+
+Create the file under `rewrite/` at the path matching your target source:
+
+```sh
+code rewrite/components/permissions/request_type.h.yaml
+```
+
+Write your substitutions, choosing the most specific rewriter available. Prefer AST rewriters (`make_virtual`, `add_friend`, `add_enum_entries`, etc.) over `regex` whenever the rewriter covers your case.
+
+### Apply the plaster
+
+```sh
+tools/cr/plaster.py apply
+```
+
+Plaster reads the target source from `git`, applies each substitution, writes the result to disk, and creates or updates the patch file under `brave/patches/`.
+
+### Verify with a dry run
+
+```sh
+tools/cr/plaster.py check
+```
+
+`check` is a dry-run mode of `apply`. It validates that all substitutions match their expected `count` without writing any files.
+
+### Explore available rewriters
+
+```sh
+tools/cr/plaster.py --help                  # overview of all commands and rewriters
+tools/cr/plaster.py --help make_virtual     # full docs for make_virtual across all namespaces
+tools/cr/plaster.py --help cxx.make_virtual # narrowed to the cxx namespace
+```
+
+### Review the generated patch
+
+The generated patch file under `brave/patches/` is ordinary unified diff format and can be reviewed in any diff viewer. Commit both the `.yaml` plaster file and the generated `.patch` file.
+
+</Steps>
+
+## File-Wide Options
+
+A plaster file may set these options at the top level (outside `substitutions:`):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `blank_macros_for_ast_parsing` | `false` | Blank parse-blocking macros and conditionals before AST matching. |
+| `blank_string_adjacent_macros_for_ast_parsing` | `false` | Blank a macro directly adjacent to a string literal before AST matching. |
+| `blank_metadata_header_macros` | `false` | Blank Views `METADATA_HEADER`/`BEGIN_METADATA`/`END_METADATA` macros before AST matching. |
+
+## Dos and Don'ts
+
+<Accordion title="✅ Write the match to convey intent, not mechanics">
+
+A regex that does not reflect the intent of the change will break on upstream edits that are unrelated to it. Anchor on meaningful constructs — the function name, the switch variable, the key being inserted near — not on accidental surrounding context.
+
+**Do** — anchors on function name and switch opening:
+
+```yaml
+regex:
+  re_pattern: '(VerifyInit\([^)]*\)\s*\{.*?\n\s*switch[^{]*\{)'
+  re_flags: [DOTALL]
+  replace: |-
+    \1
+        case ECDSA_SHA384:
+          pkey_type = EVP_PKEY_EC;
+          digest = EVP_sha384();
+          break;
+```
+
+**Don't** — anchors on a specific existing case key that could be renamed or removed:
+
+```yaml
+regex:
+  pattern: 'case ECDSA_SHA256:'
+  replace: |-
+    case ECDSA_SHA256:
+        case ECDSA_SHA384:
+```
+
+</Accordion>
+
+<Accordion title="✅ Write description: to document what and why">
+
+A good `description:` has a short subject line conveying the high-level change, followed (where the *why* is not obvious) by a paragraph elaborating the reasoning. Do not explain *how* the substitution works.
+
+**Do:**
+
+```yaml
+- description: |-
+    Force ranker querying off.
+
+    Brave never downloads or uses a translate ranker model, regardless of
+    the upstream field trial state, so RankerModelLoaderImpl must never be
+    reached.
+```
+
+**Don't** — run-on single paragraph with no subject line:
+
+```yaml
+- description: |-
+    Force ranker querying off: Brave never downloads or uses a translate
+    ranker model, regardless of the upstream field trial state.
+```
+
+</Accordion>
+
+<Accordion title="✅ Prefer a rewriter over a regex">
+
+AST rewriters understand code structure and convey intent more clearly than regex. Use them for structural transformations whenever they cover the case.
+
+**Do:**
+
+```yaml
+- description: 'Let the Brave subclass reach private members.'
+  add_friend:
+    class_name: MultiContentsView
+    friend_type: class BraveMultiContentsView
+```
+
+**Don't — use regex to inject into a private section:**
+
+```yaml
+- description: 'Let the Brave subclass reach private members.'
+  regex:
+    re_pattern: '( private:)'
+    replace: '\1\n  friend class BraveMultiContentsView;'
+```
+
+</Accordion>
+
+<Accordion title="❌ Don't rename a function to _ChromiumImpl">
+
+`preempt_function_impl` and `after_function_impl` let you insert code at the top or bottom of a function body without splitting it into a renamed `_ChromiumImpl` version. The change is visible directly in the generated patch at the function it concerns.
+
+**Do:**
+
+```yaml
+# rewrite/foo/foo.cc.yaml
+substitutions:
+  - description: 'Leave DoSomething alone when Brave has the feature off.'
+    preempt_function_impl:
+      function_name: Foo::DoSomething
+      code: |-
+        if (!IsBarEnabled(prefs())) {
+          return;
+        }
+```
+
+**Don't** — rename for wrapping and add a duplicate declaration:
+
+```yaml
+# rewrite/foo/foo.h.yaml
+substitutions:
+  - description: 'Declare DoSomething_ChromiumImpl'
+    regex:
+      re_pattern: '(void DoSomething\(\);)'
+      replace: '\1\n  void DoSomething_ChromiumImpl();'
+```
+
+</Accordion>
+
+<Accordion title="❌ Don't use plaster for mere additions">
+
+A `chromium_src` shadow file can introduce file-scope code (headers, anonymous-namespace helpers, types) before and after re-including the upstream source. Use that for additions that don't need to be embedded in the upstream source.
+
+**Do** — use a shadow file for file-scope additions:
+
+```cpp
+// chromium_src/foo/foo.cc
+#include "brave/bar/bar.h"
+
+namespace {
+constexpr int kFooMax = 42;
+}  // namespace
+
+#include <foo/foo.cc>
+```
+
+**Don't** — use plaster to inject additions at specific lines:
+
+```yaml
+# rewrite/foo/foo.cc.yaml
+substitutions:
+  - description: 'Add bar header'
+    regex:
+      re_pattern: '(#include "foo/foo.h"\n)'
+      replace: '\1#include "brave/bar/bar.h"\n'
+```
+
+</Accordion>
+
+<Accordion title="✅ Handle whitespace carefully in regex patterns">
+
+AST rewriters are indifferent to whitespace. For `regex` rewriters, avoid depending on specific whitespace arrangements. Prefer generic forms (`\s*`, `\s+`) so that reformatting around the match doesn't break it.
+
+**Do:**
+
+```yaml
+regex:
+  re_pattern: '(enum class RequestType \{.+?,)(\s+)kMaxValue = \w+'
+  re_flags: [DOTALL]
+```
+
+**Don't** — encode arbitrary newlines throughout:
+
+```yaml
+regex:
+  re_pattern: '(enum class RequestType\n\{\s*\n\s+.+?,\s*\n)\s+kMaxValue *= +\w+'
+  re_flags: [DOTALL]
+```
+
+</Accordion>
+
+<Warning>
+  Before authoring or modifying a plaster file, read the full Plaster Dos and Don'ts document at `docs/plaster_dos_and_donts.md` in the brave-core repository. It is required reading for anyone working in the `rewrite/` directory.
+</Warning>

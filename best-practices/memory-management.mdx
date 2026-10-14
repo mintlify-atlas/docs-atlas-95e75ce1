@@ -1,0 +1,389 @@
+---
+title: "Memory Management in Brave Core: Smart Pointers and Ownership"
+sidebarTitle: "Memory"
+description: "Brave Core bans std::shared_ptr, requires raw_ptr/raw_ref for unowned fields, enforces WeakPtr for async callbacks, and uses unique_ptr for ownership transfer throughout C++ code."
+---
+
+Memory management in Brave Core (and Chromium generally) follows a strict set of rules designed to eliminate use-after-free bugs. The core principle is that **ownership must be unambiguous and expressed through the type system**. `std::shared_ptr` is banned outright. Unowned pointer fields use `raw_ptr<T>` or `const raw_ref<T>`. Async callbacks across object lifetimes use `base::WeakPtr`. This page documents each rule with the canonical code examples from the source.
+
+## Ownership and Smart Pointer Selection
+
+The right pointer type is the one that accurately expresses the ownership contract — callers should not need to read the implementation to understand who frees what.
+
+| Pointer type | When to use |
+|---|---|
+| `std::unique_ptr<T>` | **Sole owner** of a heap-allocated object |
+| `scoped_refptr<T>` | **Shared ownership** of a `base::RefCounted` type (rare — prefer redesign) |
+| `raw_ptr<T>` | **Non-owning reference** to an object that outlives the holder (replaces `T*` fields) |
+| `const raw_ref<T>` | **Non-owning reference that must never be null** (replaces `T&` fields) |
+| `base::WeakPtr<T>` | **Non-owning reference** that may be invalidated, used for async callbacks |
+
+## Ownership Transfer with `unique_ptr`
+
+<Accordion title="CSM-003: Prefer unique_ptr Over new/delete">
+**Avoid manual `new` and `delete`. Use `std::make_unique`, stack variables, or member initialiser lists** to ensure deterministic cleanup without leaks on every early return.
+
+```cpp
+// ❌ WRONG — manual new/delete, leaks on early returns
+void Init() {
+  predictor_ = new BandwidthSavingsPredictor(extractor);
+  // ...
+  delete predictor_;
+}
+
+// ✅ CORRECT — unique_ptr or member initialiser list
+: predictor_(std::make_unique<BandwidthSavingsPredictor>(extractor))
+```
+</Accordion>
+
+<Accordion title="CSM-031: Don't Pass Smart Pointers by Const Reference">
+**Don't use `const std::unique_ptr<T>&` or `const scoped_refptr<T>&` as function parameters.** This forces heap allocation and couples callers to specific ownership semantics. Use a raw pointer or reference when the function doesn't modify ownership.
+
+```cpp
+// ❌ WRONG — forces callers to heap-allocate
+void Process(const std::unique_ptr<Foo>& foo);
+
+// ✅ CORRECT — raw pointer decouples ownership from allocation
+void Process(Foo* foo);
+
+// ✅ CORRECT — reference when non-null is required
+void Process(Foo& foo);
+```
+</Accordion>
+
+<Accordion title="CSM-039: Let Pointer Types in Signatures Express Ownership">
+**The pointer type in a parameter or return type is the ownership contract.**
+
+| Declare | Meaning |
+|---|---|
+| `T*` / `T&` | No ownership change; caller keeps `t` alive for the call |
+| `std::unique_ptr<T>` | The function **takes** ownership |
+| `scoped_refptr<T>` | The function may take a ref |
+
+**A function must never take ownership of a parameter passed as `T*`.** That is the single most common violation, and it's invisible at the call site.
+
+```cpp
+// ❌ WRONG — silently deletes a pointer the caller still owns
+void SetDelegate(Delegate* delegate);  // impl does: delegate_.reset(delegate);
+
+// ✅ CORRECT — ownership transfer is visible at every call site
+void SetDelegate(std::unique_ptr<Delegate> delegate);
+
+// ✅ CORRECT — borrowing only
+void UseDelegate(Delegate* delegate);
+```
+
+Also: do **not** write `return std::move(foo);` — it suppresses copy elision. Write `return foo;`.
+</Accordion>
+
+## `std::shared_ptr` Is Banned
+
+<Accordion title="CSM-005: shared_ptr Is Banned in Chromium Code">
+**Do not use `std::shared_ptr` — it is on the Chromium banned features list.** When shared ownership seems necessary, restructure to use single ownership first. If genuinely unavoidable, use `scoped_refptr<T>` with a `base::RefCounted` type — but prefer redesign over reference counting (CSM-032).
+
+```cpp
+// ❌ WRONG — shared_ptr is banned
+void Init(network::ResourceRequest& request) {
+  auto shared_request = std::make_shared<network::ResourceRequest>(request);
+}
+
+// ✅ CORRECT — pass by reference for unowned resources
+void Init(const network::ResourceRequest& request) {
+  // Use the request directly, don't take ownership
+}
+```
+</Accordion>
+
+<Accordion title="CSM-032: Avoid Reference-Counted Objects — Prefer Redesign">
+**Reference-counted objects make ownership and destruction order difficult to reason about, especially across threads.** When refcounting seems necessary: restrict the class to a single thread/sequence, use `PostTask()` to proxy calls to the correct thread, and use `base::WeakPtr` for automatic cancellation.
+</Accordion>
+
+## `raw_ptr` and `raw_ref` for Unowned Fields
+
+<Accordion title="CSM-036: Use const raw_ref for Non-Null Fields, raw_ptr Otherwise">
+**Class fields should use `const raw_ref<T>` or `raw_ptr<T>` rather than `T&` or `T*`.** Both types detect use-after-free instead of silently operating on freed memory.
+
+- `raw_ptr<T>` — replaces `T*` fields (can be null or reassigned)
+- `const raw_ref<T>` — replaces `T&` fields (mandatory, cannot be null or reseated)
+
+```cpp
+// raw_ptr<T> — replaces T* fields
+class TabFeatures {
+  raw_ptr<content::WebContents> web_contents_;
+};
+
+// const raw_ref<T> — replaces T& fields
+class BraveBrowserDelegate {
+ public:
+  explicit BraveBrowserDelegate(BrowserWindowInterface& window)
+      : window_(window) {}
+
+ private:
+  const raw_ref<BrowserWindowInterface> window_;
+};
+
+// CHECK_DEREF — when a pointer-returning function result must be
+// stored in a const raw_ref<T>
+class MyService {
+ public:
+  explicit MyService(Profile& profile)
+      : prefs_(CHECK_DEREF(profile.GetPrefs())) {}
+
+ private:
+  const raw_ref<PrefService> prefs_;
+};
+```
+
+**Use `CHECK_DEREF` only for pointers that genuinely could be null.** When a function effectively never returns null (e.g. `browser->GetProfile()`), wrapping it in `CHECK_DEREF` adds a redundant runtime check.
+</Accordion>
+
+<Accordion title="CSM-013: Place raw_ptr Members Last in Class Declarations">
+**In class declarations, place unowned `raw_ptr<>` members after owning members** (like `std::unique_ptr<>`). This follows Chromium convention and makes ownership semantics visually clear.
+
+```cpp
+// ❌ WRONG — mixed ownership order
+class MyService {
+  raw_ptr<PrefService> prefs_;
+  std::unique_ptr<Fetcher> fetcher_;
+  raw_ptr<ProfileManager> profile_manager_;
+};
+
+// ✅ CORRECT — owning members first, then unowned
+class MyService {
+  std::unique_ptr<Fetcher> fetcher_;
+  raw_ptr<PrefService> prefs_;
+  raw_ptr<ProfileManager> profile_manager_;
+};
+```
+</Accordion>
+
+## `WeakPtr` for Async Callbacks
+
+<Accordion title="CSM-007 / CSM-008: Check WeakPtr Validity; Prefer WeakPtrFactory Over SupportsWeakPtr">
+**Always check a `base::WeakPtr` is valid before dereferencing, especially after async operations.** Use `base::WeakPtrFactory<T>` as a member rather than inheriting from `base::SupportsWeakPtr<T>` — the factory performs more safety checks.
+
+```cpp
+// ❌ WRONG — may dereference invalid pointer
+void OnCallback() {
+  request_->Complete(result);
+}
+
+// ✅ CORRECT
+void OnCallback() {
+  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+  if (!request_) {
+    return;
+  }
+  request_->Complete(result);
+}
+
+// ❌ WRONG — inheriting SupportsWeakPtr
+class MyClass : public base::SupportsWeakPtr<MyClass> {};
+
+// ✅ CORRECT — WeakPtrFactory as last member
+class MyClass {
+  base::WeakPtrFactory<MyClass> weak_factory_{this};  // must be last
+};
+```
+</Accordion>
+
+<Accordion title="CSM-009: Bind WeakPtr to Member Function, Not Lambda Capture">
+**When using WeakPtr with async callbacks, bind directly to a member function.** Capturing a `WeakPtr` in a lambda provides no automatic cancellation.
+
+```cpp
+// ❌ WRONG — weak_ptr captured in lambda, no automatic cancellation
+auto weak_this = weak_ptr_factory_.GetWeakPtr();
+rpc_->GetNetworkName(base::BindOnce(
+    [](base::WeakPtr<MyService> self, Callback cb, const std::string& name) {
+      if (!self) return;
+      std::move(cb).Run(name);
+    }, weak_this, std::move(callback)));
+
+// ✅ CORRECT — weak_ptr bound to member function, auto-cancelled if invalid
+rpc_->GetNetworkName(base::BindOnce(
+    &MyService::OnGetNetworkName,
+    weak_ptr_factory_.GetWeakPtr(),
+    std::move(callback)));
+```
+</Accordion>
+
+<Accordion title="CSM-006: Invalidate WeakPtrs During Teardown">
+**Call `weak_factory_.InvalidateWeakPtrs()` at the start of shutdown.** Without this, pending callbacks can fire on partially-destroyed objects.
+
+```cpp
+// ❌ WRONG — teardown without invalidating
+void MyClass::Shutdown() {
+  CleanupResources();
+}
+
+// ✅ CORRECT — invalidate first
+void MyClass::Shutdown() {
+  weak_factory_.InvalidateWeakPtrs();
+  CleanupResources();
+}
+```
+</Accordion>
+
+## `base::Unretained` Safety Rules
+
+<Accordion title="CSM-010: Never Use base::Unretained with Thread Pool">
+**Never use `base::Unretained` when posting work to thread pools.** Use `PostTaskAndReplyWithResult` with a `WeakPtr` instead — `Unretained` across threads leads to use-after-free.
+
+```cpp
+// ❌ WRONG — Unretained across threads causes use-after-free
+base::ThreadPool::PostTask(
+    FROM_HERE, base::BindOnce(&MyClass::DoWork, base::Unretained(this)));
+
+// ✅ CORRECT — static function on pool, weak reply on main thread
+base::ThreadPool::PostTaskAndReplyWithResult(
+    FROM_HERE, base::BindOnce(&DoBlockingWork),
+    base::BindOnce(&MyClass::OnWorkDone, weak_factory_.GetWeakPtr()));
+```
+</Accordion>
+
+<Accordion title="CSM-011 / CSM-012: base::Unretained Is Safe for Owned Timers and Mojo Endpoints">
+**`base::Unretained(this)` is the preferred pattern for callbacks owned by the same class** — timers, Mojo disconnect handlers, `PrefChangeRegistrar` callbacks — because the callback cannot outlive `this`.
+
+```cpp
+// ✅ PREFERRED — timer is owned, so this is always valid when it fires
+timer_.Start(FROM_HERE, delay,
+    base::BindRepeating(&MyClass::OnTimer, base::Unretained(this)));
+
+// ✅ SAFE — class owns the remote
+remote_.set_disconnect_handler(
+    base::BindOnce(&MyClass::OnDisconnect, base::Unretained(this)));
+```
+
+Only replace `Unretained` with `WeakPtr` when the callback is posted to a thread pool, stored in a longer-lived object, or handed to an API whose lifetime is independent of `this`.
+</Accordion>
+
+## Lifetime and Teardown
+
+<Accordion title="CSM-016 / CSM-017: Clean Up in KeyedService::Shutdown(), Including ScopedObservation">
+**For `KeyedService` implementations, clean up owned resources in `Shutdown()`, not just the destructor.** The service graph has dependencies requiring orderly teardown.
+
+**`ScopedObservation` can still cause use-after-free.** Always explicitly unsubscribe observers and pref registrars in `Shutdown()` — event-triggered callbacks (pref observers) can fire after your service's `Shutdown()` if another service triggers them during its own shutdown.
+
+```cpp
+// ❌ WRONG — relying solely on ScopedObservation destructor
+class MyService : public KeyedService {
+  base::ScopedObservation<PrefService, PrefObserver> observation_{this};
+};
+
+// ✅ CORRECT — explicit unsubscribe in Shutdown
+void MyService::Shutdown() {
+  pref_change_registrar_.RemoveAll();
+  observation_.Reset();
+}
+```
+</Accordion>
+
+<Accordion title="CSM-034: Declare Members in Reverse Dependency Order for Safe Destruction">
+**C++ destroys class members in reverse declaration order.** If one member holds views (like `string_view`) into another, declare the backing storage first so it is destroyed last.
+
+```cpp
+// ❌ WRONG — map_ holds string_views into strings_,
+//            but strings_ is destroyed first
+class NameTable {
+  base::flat_map<std::string_view, NameId> map_;
+  std::deque<std::string> strings_;
+};
+
+// ✅ CORRECT — strings_ destroyed after map_
+class NameTable {
+  std::deque<std::string> strings_;
+  base::flat_map<std::string_view, NameId> map_;
+};
+```
+</Accordion>
+
+<Accordion title="CSM-030: Don't Use a Variable After std::move()">
+**Never read or use a variable after it has been `std::move()`-d.** After a move the source is in a valid but unspecified state — using it is undefined behaviour for most types and a bug for all types.
+
+```cpp
+// ❌ WRONG — model_key used after move
+if (auto result = ParseEvent(params, std::move(model_key))) {
+  callback.Run(std::move(*result));
+}
+// ... later ...
+callback.Run(GenerationResultData(std::move(event), model_key));  // BUG
+
+// ✅ CORRECT — pass by const reference, let caller handle ownership
+if (auto event = ParseEvent(params)) {
+  callback.Run(GenerationResultData(std::move(*event), model_key));
+}
+```
+</Accordion>
+
+## Thread Safety
+
+<Accordion title="CSM-015: Use SEQUENCE_CHECKER Consistently">
+**If a class is single-threaded, apply `DCHECK_CALLED_ON_VALID_SEQUENCE` to all methods or remove the sequence checker entirely.** Partial checking is misleading and makes correct code look unsafe.
+</Accordion>
+
+<Accordion title="CSM-021: Consider base::SequenceBound for Thread-Isolated Operations">
+**When a class performs blocking or IO operations and needs to be accessed asynchronously from the UI thread, use `base::SequenceBound<T>`.** This binds the object to a specific task runner and automatically posts all calls to that sequence.
+
+```cpp
+// ❌ WRONG — manual thread management
+// Caller must manually post to thread pool and bind WeakPtr
+
+// ✅ CORRECT — SequenceBound handles threading
+base::SequenceBound<ContentScraper> scraper_;
+scraper_.AsyncCall(&ContentScraper::Process).WithArgs(html);
+```
+</Accordion>
+
+## Additional Memory Rules
+
+<Accordion title="CSM-033: Don't Hold Pointers to base::Value From PrefService">
+**It is not safe to store a pointer to a `base::Value` returned from `PrefService`.** If the preference is updated or the `PrefService` is destroyed, the pointer becomes dangling.
+
+```cpp
+// ❌ WRONG — pointer dangles if pref is updated
+const base::Value::Dict* dict = &pref_service->GetDict(kMyPref);
+
+// ✅ CORRECT — clone the value for longer-lived usage
+base::Value::Dict dict = pref_service->GetDict(kMyPref).Clone();
+
+// ✅ CORRECT — use inline if only needed briefly
+if (pref_service->GetDict(kMyPref).FindString("key")) { ... }
+```
+</Accordion>
+
+<Accordion title="CSM-014: Never Bind std::vector of raw_ptr in Callbacks">
+**Never capture `std::vector<raw_ptr<T>>` in async callbacks.** The raw pointers may dangle by the time the callback runs. Use `std::vector<base::WeakPtr<T>>` instead.
+
+```cpp
+// ❌ WRONG — raw_ptrs may dangle
+base::BindOnce(&OnComplete, std::move(raw_ptr_vector));
+
+// ✅ CORRECT — weak ptrs are safe
+std::vector<base::WeakPtr<Tab>> weak_tabs;
+for (auto* tab : tabs) {
+  weak_tabs.push_back(tab->GetWeakPtr());
+}
+base::BindOnce(&OnComplete, std::move(weak_tabs));
+```
+</Accordion>
+
+<Accordion title="CSM-037: Don't Bind std::string_view or base::span in Callbacks">
+**`base::BindOnce` / `base::BindRepeating` copy bound arguments by value, but copying a view copies only its pointer — not the underlying data.** Bind an owning copy (`std::string`, `std::vector<T>`) instead. The exception is `base::raw_span<T>` (which carries dangling-pointer protection) or views over static/`constexpr` storage.
+
+```cpp
+// ❌ WRONG — backing buffer may be freed before the callback runs
+void Schedule(std::string_view name) {
+  task_runner_->PostTask(
+      FROM_HERE,
+      base::BindOnce(&MyClass::OnReady, weak_factory_.GetWeakPtr(), name));
+}
+
+// ✅ CORRECT — bind an owning copy
+void Schedule(std::string_view name) {
+  task_runner_->PostTask(
+      FROM_HERE,
+      base::BindOnce(&MyClass::OnReady, weak_factory_.GetWeakPtr(),
+                     std::string(name)));  // owns its bytes
+}
+```
+</Accordion>

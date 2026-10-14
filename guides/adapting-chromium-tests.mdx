@@ -1,0 +1,124 @@
+---
+title: "Adapting Upstream Chromium Tests for Brave"
+sidebarTitle: "Chromium Tests"
+description: "Two key mechanisms for making Chromium tests pass in Brave: CurrentTestVendor guards in production code and BraveChromeTestSetupHelper for per-pattern feature adjustments."
+---
+
+When Brave overrides or extends Chromium production code, existing upstream tests may begin to fail because the behavior they assert has changed. Rather than disabling or deleting those tests, Brave provides two targeted mechanisms that let you conditionally adjust logic — either in production code or in the test environment itself — so the tests continue to pass under both the Chromium and Brave test runners.
+
+These mechanisms live in `check_is_test.h` and `chromium_src/chrome/test/base/chrome_test_suite.cc`.
+
+## Mechanism 1: `CurrentTestVendor` in Production Code
+
+`base::CurrentTestVendor::Get()` returns which test binary is currently running. It is set to `base::TestVendor::kBrave` for `brave_*` test binaries and `base::TestVendor::kChromium` for upstream Chromium test binaries. This allows production code to vary its behavior depending on which tests are executing it.
+
+Use this when a Brave override changes a code path and upstream tests legitimately test the original path — you can preserve the original behavior specifically for upstream test runs.
+
+```cpp
+#include "base/check_is_test.h"
+
+void SomeFunction() {
+  if (base::CurrentTestVendor::Get() == base::TestVendor::kChromium) {
+    // Restore or alter logic for upstream Chromium tests.
+    // Brave's production behavior is intentionally different,
+    // but the upstream test asserts the original contract.
+  } else {
+    // Default Brave production logic runs here under:
+    // - normal browser execution
+    // - brave_* test binaries
+  }
+}
+```
+
+<Warning>
+`CurrentTestVendor` guards in production code should be used sparingly. They introduce test-only branches that will never be exercised in real user builds. Prefer adjusting the test itself (using `BraveChromeTestSetupHelper` below) when possible, or modifying the upstream test expectation with a small `chromium_src` patch.
+</Warning>
+
+### When to Use This Approach
+
+- The upstream test is testing a Chromium-specific contract that Brave intentionally breaks.
+- The behavior difference is a policy decision (e.g., a feature is disabled by default in Brave) and not a bug.
+- Modifying the test is not practical because it lives in a heavily audited upstream file.
+
+## Mechanism 2: `BraveChromeTestSetupHelper` for Feature Adjustments
+
+The `BraveChromeTestSetupHelper` class (in `//brave/chromium_src/chrome/test/base/chrome_test_suite.cc`) lets you enable or disable Chromium feature flags for specific test name patterns without modifying the upstream test source files.
+
+This is particularly useful when an upstream test relies on a feature that Brave ships with a different default state (enabled in Chromium but disabled in Brave, or vice versa).
+
+<Note>
+This approach is intended **only for Chromium tests** (those running under `kChromium` vendor). Using it to adjust Brave's own test behavior via `brave_*` binaries is not the intended use case.
+</Note>
+
+### Configuration Format
+
+Adjustments are declared as a list of `TestAdjustments` structs. Each entry specifies one or more test-name glob patterns plus lists of features to enable and/or disable when those tests run:
+
+```cpp
+class BraveChromeTestSetupHelper : public testing::EmptyTestEventListener {
+  void OnTestStart(const testing::TestInfo& test_info) override {
+    static const base::NoDestructor<std::vector<TestAdjustments>>
+        kTestAdjustments({
+            {
+                // Match any test in the SomeSuite fixture
+                .test_patterns = {"SomeTestPattern.*"},
+                // Turn on a feature the test requires
+                .enable_features = {"SomeFeature"},
+                // Turn off a feature that conflicts with the test
+                .disable_features = {"AnotherFeature"},
+            },
+            {
+                // Multiple patterns can share the same adjustment
+                .test_patterns = {
+                    "AnotherSuite.SpecificTest",
+                    "AnotherSuite.OtherTest",
+                },
+                .enable_features = {"YetAnotherFeature"},
+                .disable_features = {},
+            },
+        });
+    // ... apply adjustments for the current test_info ...
+  }
+};
+```
+
+### When to Use This Approach
+
+- An upstream test enables a feature by default that Brave disables at the `brave_*`-wide level.
+- The test does not test Brave-specific behavior — it tests general Chromium functionality that should still work when the feature is enabled.
+- You want to avoid patching the upstream test file, keeping the `chromium_src` diff minimal.
+
+## Choosing Between the Two Mechanisms
+
+| Situation | Recommended approach |
+|-----------|---------------------|
+| Brave intentionally changes production behavior that a Chromium test asserts | `CurrentTestVendor` guard in production code |
+| A Chromium test needs a feature enabled/disabled that Brave changes globally | `BraveChromeTestSetupHelper` with `test_patterns` |
+| The upstream test can be minimally patched to accept Brave's behavior | `chromium_src` override of the test file |
+| The test failure is a genuine regression in Brave | Fix the production code, not the test |
+
+## Practical Workflow
+
+<Steps>
+  <Step title="Identify the failing test">
+    Run the relevant Chromium suite and note the exact `FixtureName.TestName`:
+
+    ```sh
+    pnpm run test browser_tests --filter="SomeSuite.*"
+    ```
+  </Step>
+  <Step title="Determine why it fails">
+    Check whether Brave changes a feature flag default, overrides a production function, or fundamentally changes behavior. This determines which mechanism to use.
+  </Step>
+  <Step title="Apply the minimal fix">
+    Add either a `CurrentTestVendor` check in the production override or a new entry in `BraveChromeTestSetupHelper`. Avoid touching the upstream test source if possible.
+  </Step>
+  <Step title="Verify both vendors pass">
+    Run the test under both the `browser_tests` (Chromium) binary and the corresponding `brave_browser_tests` binary to confirm neither is broken:
+
+    ```sh
+    pnpm run test browser_tests --filter="SomeSuite.SpecificTest"
+    pnpm run test brave_browser_tests --filter="SomeSuite.SpecificTest"
+    ```
+  </Step>
+</Steps>

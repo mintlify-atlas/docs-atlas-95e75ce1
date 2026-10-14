@@ -1,0 +1,308 @@
+---
+title: "Localization and String Management in Brave Core"
+sidebarTitle: "Localization"
+description: "Brave Core l10n workflow: GRD/GRDP conventions, WebUI bindings, placeholder formatting, Transifex pipeline, and upstream string override patterns."
+---
+
+Brave Core ships in over 30 languages. All user-facing strings flow through Chromium's GRIT toolchain — defined in `.grd` and `.grdp` resource files, extracted by the Transifex pipeline, and injected into the browser at build time. The guidelines below cover the complete workflow: adding strings to the right file, formatting placeholders correctly, wiring strings into WebUI, overriding upstream strings without touching upstream files, and keeping the translation cost low by avoiding unused or poorly-described strings.
+
+## The Fundamental Rule: Never Modify Upstream GRD/GRDP Files
+
+<Warning>
+  Never add or modify strings in upstream Chromium GRD/GRDP files (e.g., `app/generated_resources.grd`, `app/settings_strings.grdp`, `components/browser_ui/strings/android/browser_ui_strings.grd`). These files are auto-replaced during every Chromium version bump — any changes will be lost on the next rebase.
+</Warning>
+
+To customize an upstream string, add a new string in the corresponding Brave GRD/GRDP file, then create a `chromium_src` override that `#undef`s the upstream `IDS_` constant and `#define`s it to your Brave-specific constant.
+
+```cpp
+// chromium_src/chrome/browser/ui/webui/password_manager/password_manager_ui.cc
+#undef IDS_PASSWORD_MANAGER_UI_EMPTY_STATE_SYNCING_USERS
+#define IDS_PASSWORD_MANAGER_UI_EMPTY_STATE_SYNCING_USERS \
+  IDS_BRAVE_PASSWORD_MANAGER_UI_EMPTY_STATE_SIGNEDOUT_USERS
+```
+
+For simple word/phrase substitutions across upstream strings in all locales, use `brave/script/lib/l10n/grd_string_replacements.py` with `default_replacements` and run `pnpm run chromium_rebase_l10n`. This applies replacements consistently across all localized versions without needing to manually edit GRD files.
+
+## Adding New Strings
+
+<Steps>
+
+### Choose the right GRD/GRDP file
+
+Brave-specific strings go in Brave-owned resource files, not upstream ones. Common targets:
+
+| Context | File |
+|---|---|
+| Desktop browser UI | `app/brave_generated_resources.grd` |
+| Desktop settings | `app/brave_settings_strings.grdp` |
+| Android | `browser/ui/android/strings/android_brave_strings.grd` |
+| WebUI components | `components/brave_components_strings.grd` + a `.grdp` |
+
+### Write the `<message>` element correctly
+
+Every message element requires a non-empty `desc` attribute. Include the UI element type (title, button label, description, tooltip, placeholder, menu item) and disambiguate terms with multiple meanings.
+
+```xml
+<!-- ✅ CORRECT - descriptive desc, correct ellipsis, SCREAMING_SNAKE_CASE placeholder -->
+<message name="IDS_SHRED_CONFIRMATION" desc="Confirmation dialog title for shredding site data. Shown when the user clicks the shred button in the site info panel.">
+  Shredding will delete site data and close all
+  <ph name="SITE_NAME">$1<ex>example.com</ex></ph> tabs.
+</message>
+
+<!-- ❌ WRONG - empty desc, three periods instead of ellipsis, no example tag -->
+<message name="IDS_LOADING" desc="">
+  Loading...
+</message>
+
+<!-- ✅ CORRECT - proper ellipsis character -->
+<message name="IDS_LOADING" desc="Loading indicator label shown below the spinner">
+  Loading…
+</message>
+```
+
+### Don't add `translateable="true"` explicitly
+
+`translateable="true"` is the default in `.grdp` files — never add it explicitly. The tooling only looks for `translateable="false"` when excluding strings from translation.
+
+### Only add strings that are actively used
+
+Every string in a GRD/GRDP file gets sent to translators and translated into all supported languages. Only add strings when they are actively referenced in the codebase. If a string is no longer used after a refactor, remove it.
+
+</Steps>
+
+## Placeholder Formatting
+
+Placeholders must have descriptive `name` attributes in `SCREAMING_SNAKE_CASE` and include `<ex>` example tags showing translators what value will appear at runtime.
+
+```xml
+<!-- Single runtime value -->
+<message name="IDS_SHRED_CONFIRMATION" desc="Confirmation dialog for shredding site data">
+  Shredding will delete site data and close all
+  <ph name="SITE_NAME">$1<ex>example.com</ex></ph> tabs.
+</message>
+
+<!-- Link placeholders use LINK_BEGIN/LINK_END pattern -->
+<message name="IDS_LEARN_MORE" desc="Text with learn more link in the privacy settings section">
+  <ph name="LINK_BEGIN">$1</ph>Learn more<ph name="LINK_END">$2</ph>
+</message>
+
+<!-- ❌ WRONG - no descriptive name, no example -->
+<message name="IDS_SHRED_CONFIRMATION" desc="Confirmation">
+  Shredding will delete site data for <ph name="PH_1">$1</ph>.
+</message>
+```
+
+<Note>
+  Build links in the UI (TypeScript/HTML), not in localized strings. Pass the URL separately via `AddString` or a mojom constant. Do not embed URLs into localized strings via C++ string formatting.
+</Note>
+
+```cpp
+// ❌ WRONG - URL embedded in localized string
+html_source->AddString(
+    "sectionDescription",
+    l10n_util::GetStringFUTF16(IDS_SECTION_DESCRIPTION, kLearnMoreURL));
+
+// ✅ CORRECT - URL passed separately, link built in UI
+html_source->AddString("sectionDescription",
+    l10n_util::GetStringUTF16(IDS_SECTION_DESCRIPTION));
+html_source->AddString("learnMoreUrl", kLearnMoreURL);
+```
+
+## WebUI String Integration
+
+Brave Core extends GRIT with the ability to automatically generate frontend bindings for strings and an associated TypeScript enum. This eliminates the need for individual `source->AddLocalizedString()` calls.
+
+<Steps>
+
+### Mark the string with formatter_data
+
+Add `formatter_data="webui=MyUi"` to the message element. The value must exactly match the WebUI component identifier — a typo or case mismatch means the string won't be available in the component.
+
+```xml
+<!-- In my_strings.grdp -->
+
+<!-- ❌ WRONG - missing formatter_data -->
+<message name="IDS_MY_UI_MESSAGE_NAME" desc="Welcome message for My UI">
+  Welcome to Brave
+</message>
+
+<!-- ✅ CORRECT - formatter_data matches WebUI component name exactly -->
+<message name="IDS_MY_UI_MESSAGE_NAME" formatter_data="webui=MyUi"
+    desc="Welcome message shown on the My UI landing page">
+  Welcome to Brave
+</message>
+```
+
+### Add bulk strings in C++
+
+Include the generated header and use `AddLocalizedStrings` instead of individual `AddLocalizedString` calls.
+
+```cpp
+// In my_ui.cc
+#include "components/grit/brave_components_webui_strings.h"
+
+MyUi::MyUi(WebUI* ui) {
+  content::WebUIDataSource* source = ...;
+
+  // ❌ WRONG - individual calls for each string
+  source->AddLocalizedString("messageName", IDS_MY_UI_MESSAGE_NAME);
+
+  // ✅ CORRECT - bulk registration from generated array
+  source->AddLocalizedStrings(webui::kMyUiStrings);
+}
+```
+
+### Import the TypeScript enum
+
+Use the generated TypeScript enum instead of raw string keys. This enables static analysis and prevents dead string accumulation.
+
+```tsx
+// In my_component.tsx
+import { MyUiStrings } from 'gen/components/grit/brave_components_webui_strings'
+
+export default function Component() {
+  return <div>
+    {/* ❌ WRONG - raw string key */}
+    {getLocale('messageName')}
+
+    {/* ✅ CORRECT - typed enum reference */}
+    {getLocale(MyUiStrings.MY_UI_MESSAGE_NAME)}
+  </div>
+}
+```
+
+### Set up the global S alias (once per WebUI)
+
+Create a `strings.ts` file in your WebUI's resources directory to alias the enum as a global `S` object for convenient access across all files without repeated imports.
+
+```ts
+// strings.ts
+import '$web-common/strings'
+
+import { MyUiStrings } from 'gen/components/grit/brave_components_webui_strings'
+
+declare global {
+  interface Strings {
+    MyUiStrings: typeof MyUiStrings
+  }
+}
+```
+
+Import it from the entry point:
+
+```tsx
+// my_ui.tsx
+import './strings'
+```
+
+Now use the enum from any file without importing it:
+
+```tsx
+// my_component.tsx (no import needed)
+export default function Component() {
+  return <div>
+    {getLocale(S.MY_UI_MESSAGE_NAME)}
+  </div>
+}
+```
+
+</Steps>
+
+<Tip>
+  Use `I18nMixinLit` in Lit-based WebUI components instead of calling `loadTimeData.getString()` directly. The mixin provides consistent i18n patterns and is the standard approach for Lit WebUIs.
+</Tip>
+
+## Avoiding Dynamic Key Construction
+
+Never dynamically construct string keys for `getLocale()` calls. This makes static analysis impossible and prevents dead string detection.
+
+```tsx
+// ❌ WRONG - dynamic key construction
+getLocale(`CHAT_UI_${model.key.toUpperCase().replaceAll('-', '_')}_SUBTITLE`)
+
+// ✅ CORRECT - explicit string reference
+getLocale(S.CHAT_UI_CLAUDE_SUBTITLE)
+
+// ✅ ALSO CORRECT - data source provides the string or key
+model.description  // provided by server API / mojom struct
+```
+
+## String Quality Conventions
+
+<Accordion title="Capitalization consistency">
+
+All strings within a single feature or UI surface must use a consistent capitalization style. Do not mix title case and sentence case within the same group of UI controls at the same hierarchy level.
+
+- **Title case** for: page titles, section headers, button labels, menu items
+- **Sentence case** for: descriptions, body text, tooltips, helper text
+
+</Accordion>
+
+<Accordion title="Voice and style conventions">
+
+Follow these conventions for user-facing string text:
+
+- **Use "Brave's" instead of "our"** — e.g., "access Brave's premium products" not "access our premium products"
+- **Use "and more" instead of "etc."** — e.g., "bookmarks, passwords, and more" not "bookmarks, passwords, etc."
+- **Match established feature terminology** — Shields uses "up/down" not "on/off". Check existing strings for a feature's vocabulary before adding new ones.
+- **Use natural word order around placeholders** — test by substituting an example value and reading the sentence aloud
+- **Avoid possessive constructions** — prefer "the content of this page" over "this page's contents" for better translatability
+- **Be explicit about data-sharing actions** — "send your tabs to Brave AI" not just "send your tabs"
+
+</Accordion>
+
+<Accordion title="Punctuation rules for settings toggle descriptions">
+
+Settings toggle descriptions follow specific punctuation rules:
+
+- **Single-sentence descriptions** should NOT end with a period.
+- **Multi-sentence descriptions** SHOULD end with a period on the last sentence.
+
+</Accordion>
+
+<Accordion title="Use proper ellipsis characters">
+
+In user-facing strings, use the proper Unicode ellipsis character (`…`) instead of three periods (`...`). This is a standard typographic convention for UI text.
+
+</Accordion>
+
+<Accordion title="Include UI screenshots in PRs">
+
+When a PR adds or modifies user-facing strings, include a screenshot of the affected UI in the PR description. This allows string reviewers to verify the string in context — checking for truncation, capitalization consistency, layout issues, and correct terminology. Add screenshots to the PR description body, not as inline code comments.
+
+</Accordion>
+
+## Upstream Product Name Replacements
+
+During Chromium rebases, review all new strings in upstream GRD/GRDP files for Google product references (Gemini, Google Pay, Chrome, etc.) that need to be replaced with Brave equivalents. New user-facing strings introduced by rebases should be reviewed to ensure they show correct Brave branding.
+
+Also verify correct product name usage: "Brave Wallet" refers specifically to the cryptocurrency wallet, not general autofill/payment card features.
+
+<Note>
+  For bulk product name substitutions across all locales, use `grd_string_replacements.py` with `default_replacements` and run `pnpm run chromium_rebase_l10n` rather than manually editing GRD files.
+</Note>
+
+## String Description Quality Checklist
+
+Before merging a PR that adds strings, verify each `<message>` element:
+
+<CardGroup cols={2}>
+  <Card title="Non-empty desc" icon="circle-check">
+    Every `<message>` element must have a non-empty description attribute.
+  </Card>
+  <Card title="Element type specified" icon="circle-check">
+    Include whether the string is a title, button label, description, tooltip, placeholder, or menu item.
+  </Card>
+  <Card title="Ambiguous terms disambiguated" icon="circle-check">
+    Words like "History", "Wallet", "Send" need qualification to help translators.
+  </Card>
+  <Card title="Unique descriptions" icon="circle-check">
+    Do not copy-paste the same `desc` across different strings that serve different purposes.
+  </Card>
+  <Card title="Placeholder examples" icon="circle-check">
+    Every `<ph>` element has a descriptive SCREAMING_SNAKE_CASE name and an `<ex>` tag.
+  </Card>
+  <Card title="String is actively used" icon="circle-check">
+    The IDS_ constant is referenced in the codebase — not added speculatively.
+  </Card>
+</CardGroup>

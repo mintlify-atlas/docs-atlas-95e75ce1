@@ -1,0 +1,255 @@
+---
+title: "AI Chat (Leo): Privacy-Preserving LLM Integration"
+sidebarTitle: "AI Chat"
+description: "Leo routes LLM inference through Oblivious HTTP (RFC 9458) with HPKE key establishment so the AI server never learns the user's IP address or identity."
+---
+
+Leo is Brave's built-in AI assistant, accessible as a browser side panel on desktop and as a native overlay on mobile. It answers questions, summarizes pages, rewrites text, and can access page content — all while applying a layered privacy model that prevents the inference server from observing who is asking. The central mechanism is **Oblivious HTTP (OHTTP, RFC 9458)**: each LLM inference request is encrypted with a per-session **Hybrid Public Key Encryption (HPKE)** key, sent through Brave's relay server, so the AI backend sees only the ciphertext forwarded by the relay and never the client's IP address. Premium subscribers authenticate with anonymous SKU credentials from Brave's Privacy Pass pipeline, further decoupling identity from usage.
+
+## Privacy Model: OHTTP and HPKE
+
+Standard HTTPS inference requests carry the client's IP address and TLS fingerprint to the inference server. OHTTP breaks this link by routing the encrypted inner request through a **relay** (the AI Chat server) that strips identifying headers before forwarding to the **gateway** (the actual inference backend).
+
+```
+Browser                   Relay (AI Chat Server)       Gateway (Inference)
+   |                              |                           |
+   |-- 1. Fetch HPKE key config ->|                           |
+   |   GET /v1/models/{name}/ohttp_config                     |
+   |<- 2. KeyConfigResult --------|                           |
+   |   { key_config, endpoint_url, upstream_model_name }      |
+   |                              |                           |
+   |-- 3. Encrypt inner request   |                           |
+   |   HPKE(key_config, POST /v1/chat/completions)            |
+   |                              |                           |
+   |-- 4. OHTTP outer request --->|                           |
+   |   (carries Leo credential + Brave-Services-Key header)   |
+   |                              |-- 5. Decrypt + forward -->|
+   |                              |   (no client IP visible)  |
+   |                              |<- 6. Encrypted response --|
+   |<- 7. OHTTP outer response ---|                           |
+   |-- 8. Decrypt with HPKE       |                           |
+   |   (SSE stream or full body)  |                           |
+```
+
+### HPKE Key Configuration
+
+`ObliviousHttpConfigManager` fetches and caches the server's HPKE public-key configuration from `/v1/models/{model_name}/ohttp_config`. The config carries the raw HPKE key bytes, the inner-request endpoint URL, and the upstream model name to use in the inference body. Configs are stored in a dict pref keyed by model name and expired automatically:
+
+```cpp
+// components/ai_chat/core/browser/engine/oblivious_http_config_manager.h
+
+class ObliviousHttpConfigManager {
+ public:
+  struct KeyConfigResult {
+    std::string key_config;        // decoded raw HPKE key bytes
+    GURL endpoint_url;             // inner-request resource URL
+    std::string upstream_model_name; // model name in the inference body
+  };
+
+  // Fetches a fresh key config for |model_name|, calling |callback| on
+  // completion. Uses a cached config if one exists and has not expired.
+  virtual void RequestKeyConfig(const std::string& model_name,
+                                KeyConfigCallback callback);
+
+  static void DeleteExpiredKeyConfigs(PrefService* profile_prefs);
+};
+```
+
+### OHTTP Request Dispatch
+
+`ObliviousHttpAPIClient` orchestrates the full OHTTP lifecycle per inference request. It inherits from `OAIAPIClient` to reuse the OpenAI-compatible request formatting, then wraps the payload with HPKE encryption using Chromium's `network::mojom::ObliviousHttpRequest` Mojo interface:
+
+```cpp
+// components/ai_chat/core/browser/engine/oblivious_http_api_client.h
+
+// Performs OAI-compatible chat completion requests over OHTTP. Routes the
+// inner HTTP request through the AI Chat OHTTP relay (the AI Chat server),
+// using a cached HPKE key config managed by ObliviousHttpConfigManager. The Leo
+// SKU credential, the Brave services key, and the model name are passed as
+// outer (relay) request headers.
+class ObliviousHttpAPIClient : public OAIAPIClient {
+ public:
+  void PerformRequest(
+      const mojom::ModelOptions& model_options,
+      std::vector<OAIMessage> messages,
+      std::optional<base::ListValue> oai_tool_definitions,
+      GenerationDataCallback data_received_callback,
+      GenerationCompletedCallback completed_callback,
+      const std::optional<std::vector<std::string>>& stop_sequences
+          = std::nullopt) override;
+};
+```
+
+The per-request flow:
+
+<Steps>
+
+### Credential fetch
+
+`AIChatCredentialManager::FetchPremiumCredential` is called to retrieve an unspent `CredentialCacheEntry` from the local credential cache. The credential was previously issued via the SKUs SDK using the same Privacy Pass VOPRF blind-signing pipeline used by Brave VPN. Non-premium users skip this step.
+
+### HPKE key config fetch
+
+`ObliviousHttpConfigManager::RequestKeyConfig` is called with the model name. If a valid cached config is available it resolves synchronously; otherwise a network fetch to `/v1/models/{name}/ohttp_config` is performed first.
+
+### Request encryption and dispatch
+
+With both the credential and the key config available, `DispatchOHTTPRequest` encrypts the inner `POST /v1/chat/completions` JSON body using the server's HPKE public key and sends the outer OHTTP request to the relay. The Leo SKU credential and `Brave-Services-Key` are included as **outer headers** (visible to the relay but not to the inference backend).
+
+### Response decryption
+
+For streaming responses, `InnerClient` implements both `network::mojom::ObliviousHttpClient` (completion) and `network::mojom::ObliviousHttpChunkClient` (SSE body chunks). Each chunk is decrypted and parsed with the SSE parser before being forwarded to the `GenerationDataCallback` for display.
+
+</Steps>
+
+## Premium Credential Integration
+
+Leo's premium tier uses the same Privacy Pass–based anonymous credential system as Brave VPN. `AIChatCredentialManager` interfaces with the **SKUs SDK** (Rust, in `components/skus/`) to check subscription status and fetch pre-issued credentials:
+
+```cpp
+// components/ai_chat/core/browser/ai_chat_credential_manager.h
+
+struct CredentialCacheEntry {
+  std::string credential;
+  base::Time  expires_at;
+};
+
+class AIChatCredentialManager {
+ public:
+  virtual void GetPremiumStatus(
+      mojom::Service::GetPremiumStatusCallback callback);
+
+  // Retrieves an unspent credential from the local cache (or fetches a
+  // fresh one from the SKUs SDK if the cache is empty).
+  virtual void FetchPremiumCredential(
+      FetchPremiumCredentialCallback callback);
+
+  virtual void PutCredentialInCache(CredentialCacheEntry credential);
+};
+```
+
+The credential is a **TimeLimitedV2** token — blindly signed by Brave's Challenge Bypass Server, valid for a short time window, single-use per window, and containing no account or payment information. When passed as an outer OHTTP header it proves to the relay that the request originates from a paying subscriber without disclosing who that subscriber is.
+
+<Note>
+  Free-tier users access Leo through Brave's hosted inference with rate limits but
+  without credential headers. The `kFreemiumAvailable` feature param controls
+  which models are accessible without a subscription.
+</Note>
+
+## Model Service
+
+`ModelService` (`core/browser/model_service.h`) is the `KeyedService` responsible for the model catalog: built-in Leo models (which may be remotely updated via a config fetch) and user-defined custom models backed by external OpenAI-compatible APIs.
+
+| Feature Param | Description |
+|---|---|
+| `kAIModelsDefaultKey` | Default model key for free-tier users |
+| `kAIModelsPremiumDefaultKey` | Default model key for premium users |
+| `kAIModelsVisionDefaultKey` | Default vision-capable model for free users |
+| `kAIModelsPremiumVisionDefaultKey` | Default vision-capable model for premium users |
+| `kFreemiumAvailable` | Whether certain freemium models are available without subscription |
+| `kAIChatSSE` | Enable Server-Sent Events streaming for inference responses |
+
+Custom models are stored with encrypted API keys using `OSCryptAsync`. The encryptor arrives asynchronously; requests issued before `OnEncryptorReady` fires will carry an empty API key and be rejected by the downstream server until the model list is refreshed.
+
+## Engine Consumer Architecture
+
+The abstract `EngineConsumer` class decouples the conversation layer from the specific inference backend. Two concrete implementations exist in `core/browser/engine/`:
+
+<CardGroup cols={2}>
+  <Card title="EngineConsumerConversationAPI" icon="server">
+    Calls Brave's Conversation API via `ConversationAPIClient`. Used for built-in Leo models. Supports the OpenAI-compatible message format and tool definitions.
+  </Card>
+  <Card title="EngineConsumerOAI" icon="plug">
+    Calls any OpenAI-compatible endpoint via `OAIAPIClient`. Used for user-configured custom models pointing at local Ollama instances or external providers.
+  </Card>
+</CardGroup>
+
+For privacy-sensitive built-in Leo calls, `ConversationAPIClient` delegates to `ObliviousHttpAPIClient`, which wraps the request in OHTTP/HPKE before dispatch. Non-privacy-sensitive paths (e.g., local Ollama via `OAIAPIClient`) go direct over HTTPS.
+
+## Tools and Agent Capabilities
+
+Leo supports an extensible tool system. Tool names are defined as Mojo constants and dispatched by `ConversationHandler`:
+
+```cpp
+// components/ai_chat/core/common/mojom/ai_chat.mojom (excerpt)
+const string kBraveWebSearchToolName   = "brave_web_search";
+const string kDeepResearchToolName     = "deep_research";
+const string kCodeExecutionToolName    = "code_execution_tool";
+const string kMemoryStorageToolName    = "memory_storage_tool";
+const string kWebContextSearchToolName = "web_context_search";  // NEAR E2EE
+const string kClickToolName            = "click_element";
+const string kTypeTextToolName         = "type_text";
+const string kNavigateToolName         = "web_page_navigator";
+```
+
+Browser-process tool providers (`BrowserToolProvider`, `ContentAgentToolProvider`) are registered with `AIChatService` and contribute tool definitions to each conversation.
+
+## Component Structure
+
+```
+components/ai_chat/
+├── core/
+│   ├── browser/                    # Browser-process KeyedServices
+│   │   ├── ai_chat_service.cc      # Central service: conversations + tools
+│   │   ├── ai_chat_credential_manager.cc  # SKU credential fetch + cache
+│   │   ├── model_service.cc        # Model catalog, remote config, custom models
+│   │   ├── engine/
+│   │   │   ├── engine_consumer.h              # Abstract inference interface
+│   │   │   ├── engine_consumer_conversation_api.cc  # Brave API backend
+│   │   │   ├── engine_consumer_oai.cc         # OpenAI-compatible backend
+│   │   │   ├── oblivious_http_api_client.cc   # OHTTP/HPKE request dispatch
+│   │   │   ├── oblivious_http_config_manager.cc # HPKE key config cache
+│   │   │   └── conversation_api_client.cc     # HTTP Conversation API client
+│   │   └── associated_content_driver.cc       # Page content extraction
+│   └── common/
+│       ├── mojom/ai_chat.mojom     # All public Mojo contracts + tool names
+│       ├── features.h              # Feature flags and model param keys
+│       └── pref_names.h            # Preference key registry
+├── content/                        # Content-API layer (renderer bridge)
+├── ios/                            # iOS-specific bridge
+├── renderer/                       # Renderer-side page content extraction
+└── resources/                      # UI assets
+```
+
+```
+browser/ai_chat/                    # Browser-process integration tests + factories
+├── ai_chat_service_factory.cc      # KeyedService factory
+├── model_service_factory.cc        # ModelService factory
+├── browser_tool_provider.cc        # Browser tool registration
+├── pdf_text_extractor.cc           # PDF content extraction for context
+└── tools/                          # Additional tool provider implementations
+```
+
+## Running Tests
+
+<Tabs>
+  <Tab title="Browser Tests">
+    ```bash
+    pnpm test brave_browser_tests --filter=AIChat*
+    ```
+  </Tab>
+  <Tab title="Unit Tests">
+    ```bash
+    pnpm test brave_unit_tests --filter=AIChat*
+    ```
+  </Tab>
+  <Tab title="Specific Suites">
+    ```bash
+    # Metrics tests
+    pnpm test brave_browser_tests --filter=AIChatMetrics*
+
+    # Policy enforcement
+    pnpm test brave_browser_tests --filter=AIChatPolicy*
+
+    # OHTTP config manager
+    pnpm test brave_unit_tests --filter=ObliviousHttpConfigManager*
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+  Leo is gated behind the `kAIChat` base feature flag. On builds where
+  `ENABLE_AI_CHAT` is false, all `ai_chat` components are excluded from
+  compilation entirely (enforced by `static_assert(BUILDFLAG(ENABLE_AI_CHAT))`
+  in `features.h`).
+</Warning>

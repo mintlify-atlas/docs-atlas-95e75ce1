@@ -1,0 +1,194 @@
+---
+title: "IPFS and Decentralized Web Support in Brave"
+sidebarTitle: "IPFS & Web3"
+description: "Brave natively resolves ipfs:// and ipns:// URLs through a built-in gateway, and handles ENS, Unstoppable Domains, and SNS via a decentralized DNS component."
+---
+
+Brave provides first-class support for the decentralized web at the browser level — no extensions required. Users can navigate to `ipfs://` and `ipns://` addresses directly, optionally running a local IPFS node through a platform-specific component, and resolve human-readable blockchain domain names (ENS, Unstoppable Domains, and Solana Name Service) through a dedicated decentralized DNS component. The architecture keeps all this functionality behind user-configurable preferences with sensible Ask-before-enabling defaults.
+
+## IPFS Support
+
+### The `components/ipfs/` Component
+
+```
+components/ipfs/
+├── ipfs_utils.{cc,h}                 # URI translation and content hash parsing
+├── ipfs_prefs.{cc,h}                 # Pref registration and deprecation helpers
+├── ipfs_common.h                     # Platform-specific IPFS client component IDs
+├── ipfs_component_cleaner.{cc,h}     # Removes stale local node binaries
+├── buildflags/                       # ENABLE_IPFS buildflag
+└── test/                             # Unit tests
+```
+
+The default public gateway is `https://inbrowser.link`, used when local node mode is not active:
+
+```cpp
+// From components/ipfs/ipfs_utils.h
+namespace ipfs {
+
+inline constexpr char kIPFSScheme[] = "ipfs";
+inline constexpr char kDefaultPublicGateway[] = "https://inbrowser.link";
+
+// Translates an ipfs:// or ipns:// URL to its gateway equivalent.
+// Set use_subdomain=true for Origin-isolation via subdomain gateways.
+bool TranslateIPFSURI(const GURL& url, GURL* new_url, bool use_subdomain);
+
+// Converts an ENS/UD contenthash (bytes) to an ipfs:// CIDv1 URL
+GURL ContentHashToCIDv1URL(base::span<const uint8_t> contenthash);
+
+}  // namespace ipfs
+```
+
+### URL Schemes
+
+Brave registers and handles two custom URL schemes:
+
+| Scheme | Example | Description |
+|---|---|---|
+| `ipfs://` | `ipfs://bafybe...` | Content-addressed, immutable CID |
+| `ipns://` | `ipns://en.wikipedia-on-ipfs.org` | Mutable pointer (name record) |
+
+When a user navigates to an `ipfs://` or `ipns://` URL, `TranslateIPFSURI` rewrites the request to the configured gateway before the network stack sees it. If subdomain isolation is enabled, the CID becomes a DNS label (`bafybe...ipfs.inbrowser.link`) to enforce Origin isolation in the browser's security model.
+
+### Local IPFS Node
+
+On desktop platforms, Brave can run a local IPFS node as an optional component. The node binary is distributed as a Brave component updater package with platform-specific component IDs:
+
+```cpp
+// From components/ipfs/ipfs_common.h
+#if BUILDFLAG(IS_WIN)
+static const base::FilePath::StringViewType kIpfsClientComponentId =
+    FILE_PATH_LITERAL("lnbclahgobmjphilkalbhebakmblnbij");
+#elif BUILDFLAG(IS_MAC)
+#if defined(ARCH_CPU_ARM64)
+static const base::FilePath::StringViewType kIpfsClientComponentId =
+    FILE_PATH_LITERAL("lejaflgbgglfaomemffoaappaihfligf");
+#else
+static const base::FilePath::StringViewType kIpfsClientComponentId =
+    FILE_PATH_LITERAL("nljcddpbnaianmglkpkneakjaapinabi");
+#endif
+#elif BUILDFLAG(IS_LINUX)
+// arm64 and x64 have separate component IDs
+#endif
+```
+
+When the local node is active, `TranslateIPFSURI` targets `http://localhost:<port>` instead of the public gateway, giving users full local access to their IPFS datastore and eliminating the gateway as a point of trust.
+
+<Note>
+The `IpfsComponentCleaner` removes stale local node binaries left behind by previous component versions, keeping the user's disk clean without manual intervention.
+</Note>
+
+## Decentralized DNS
+
+### The `components/decentralized_dns/` Component
+
+```
+components/decentralized_dns/
+├── core/
+│   ├── constants.h         # ResolveMethodTypes and EnsOffchainResolveMethod enums
+│   ├── pref_names.h        # Pref key strings for each resolver
+│   └── utils.{cc,h}        # TLD detection and resolve-method accessors
+└── content/
+    ├── decentralized_dns_navigation_throttle.{cc,h}  # Intercepts navigations
+    ├── decentralized_dns_opt_in_page.{cc,h}           # Ask interstitial
+    ├── ens_offchain_lookup_opt_in_page.{cc,h}         # ENS offchain ask
+    └── resources/
+```
+
+### Supported Name Systems
+
+<CardGroup cols={3}>
+  <Card title="ENS" icon="ethereum">
+    Ethereum Name Service domains (`.eth`). Resolved via an Ethereum JSON-RPC server. Supports optional offchain resolution for CCIP-Read gateways.
+  </Card>
+  <Card title="Unstoppable Domains" icon="globe">
+    `.crypto`, `.nft`, `.blockchain`, `.x`, `.wallet`, and more. Resolved via Ethereum JSON-RPC.
+  </Card>
+  <Card title="SNS" icon="circle-s">
+    Solana Name Service domains. Resolved via a Solana JSON-RPC server.
+  </Card>
+</CardGroup>
+
+### Resolution Method Configuration
+
+Each name system has an independent `ResolveMethodTypes` pref that defaults to `ASK`:
+
+```cpp
+// From components/decentralized_dns/core/constants.h
+enum class ResolveMethodTypes {
+  ASK,                     // Show an interstitial prompting the user
+  DISABLED,                // Block all resolution for this system
+  DEPRECATED_DNS_OVER_HTTPS,
+  ENABLED,                 // Resolve via JSON-RPC
+  MAX_VALUE = ENABLED,
+};
+
+enum class EnsOffchainResolveMethod {
+  kAsk,       // Ask before following offchain CCIP-Read lookups
+  kDisabled,  // Block offchain lookups
+  kEnabled,   // Follow offchain lookups silently
+};
+```
+
+The pref keys and their accessor functions are centralised in `utils.h`:
+
+```cpp
+// From components/decentralized_dns/core/utils.h
+
+// ENS
+bool IsENSTLD(std::string_view host);
+void SetENSResolveMethod(PrefService* local_state, ResolveMethodTypes method);
+ResolveMethodTypes GetENSResolveMethod(PrefService* local_state);
+bool IsENSResolveMethodEnabled(PrefService* local_state);
+
+// Unstoppable Domains
+bool IsUnstoppableDomainsTLD(std::string_view host);
+void SetUnstoppableDomainsResolveMethod(PrefService* local_state,
+                                        ResolveMethodTypes method);
+bool IsUnstoppableDomainsResolveMethodEnabled(PrefService* local_state);
+
+// Solana Name Service
+bool IsSnsTLD(std::string_view host);
+void SetSnsResolveMethod(PrefService* local_state, ResolveMethodTypes method);
+bool IsSnsResolveMethodEnabled(PrefService* local_state);
+
+// ENS offchain (CCIP-Read)
+void SetEnsOffchainResolveMethod(PrefService* local_state,
+                                 EnsOffchainResolveMethod method);
+EnsOffchainResolveMethod GetEnsOffchainResolveMethod(PrefService* local_state);
+```
+
+### Navigation Flow
+
+<Steps>
+  <Step title="Navigation intercepted">
+    `DecentralizedDnsNavigationThrottle` checks every navigation. If the hostname matches a known decentralized TLD (`.eth`, `.crypto`, `.sol`, etc.) it pauses the load.
+  </Step>
+  <Step title="Resolve method check">
+    The throttle reads the relevant `ResolveMethodTypes` pref. If `ASK`, it shows the opt-in interstitial page. If `DISABLED`, the navigation is blocked. If `ENABLED`, resolution proceeds.
+  </Step>
+  <Step title="JSON-RPC lookup">
+    The browser issues a request to the configured Ethereum or Solana JSON-RPC endpoint to look up the contenthash or address record for the domain.
+  </Step>
+  <Step title="Content hash translation">
+    For IPFS-hosted content, the returned contenthash bytes are decoded by `ContentHashToCIDv1URL()` into an `ipfs://` URL, which `TranslateIPFSURI` then rewrites to the configured gateway.
+  </Step>
+</Steps>
+
+### ENS Offchain (CCIP-Read) Interstitial
+
+ENS supports "offchain" resolver records via the CCIP-Read standard (EIP-3668). Because offchain lookups contact third-party HTTP gateways outside Brave's control, Brave shows a separate opt-in interstitial (`EnsOffchainLookupOptInPage`) before following them. Users can set `EnsOffchainResolveMethod::kEnabled` to skip the prompt for future lookups.
+
+## Privacy Considerations
+
+<Accordion title="Gateway trust">
+When using a public IPFS gateway (including the default `inbrowser.link`), the gateway operator can observe which CIDs are being fetched. Use a local IPFS node (`brave://settings/ipfs`) to eliminate this trust requirement.
+</Accordion>
+
+<Accordion title="JSON-RPC endpoint">
+ENS, Unstoppable Domains, and SNS resolution sends domain names to a JSON-RPC server. Brave's default endpoints are operated under Brave's privacy policy. Advanced users can configure custom RPC endpoints in Brave Wallet settings.
+</Accordion>
+
+<Accordion title="Ask-by-default">
+All three decentralized DNS systems default to `ResolveMethodTypes::ASK`. This means the first time a user navigates to a `.eth` or `.crypto` domain, Brave shows an interstitial rather than silently contacting an Ethereum node, ensuring informed consent.
+</Accordion>

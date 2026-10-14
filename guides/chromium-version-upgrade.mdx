@@ -1,0 +1,200 @@
+---
+title: "Upgrading Brave Core to a New Chromium Version"
+sidebarTitle: "Version Upgrade"
+description: "A version bump updates the chrome tag in package.json, resolves patch conflicts with --3way, regenerates all patches, and re-syncs localization strings for the new Chromium release."
+---
+
+Tracking upstream Chromium closely is fundamental to Brave's security posture and feature roadmap. A version bump — updating brave-core to depend on a newer Chromium tag — is a structured process that produces four canonical commit types and requires careful patch conflict resolution. This guide walks through the complete upgrade workflow, the git commands involved, and how to handle the common failure modes.
+
+## Understanding the Chromium Tag
+
+The Chromium version that brave-core builds against is stored in `package.json` under the `config.projects.chrome.tag` field:
+
+```json
+{
+  "config": {
+    "projects": {
+      "chrome": {
+        "dir": "src",
+        "tag": "134.0.6998.95",
+        "repository": {
+          "url": "https://github.com/brave/chromium"
+        }
+      }
+    }
+  }
+}
+```
+
+Every `pnpm run init` and `pnpm run sync` reads this tag to check out the correct Chromium commit and apply all patches on top of it. Changing the tag is therefore the single authoritative action that starts a version bump.
+
+## The Four Canonical Commit Types
+
+When landing a version bump, the convention is to produce exactly these four commits (plus any additional fixes needed to restore the build):
+
+| Commit | Purpose |
+|--------|---------|
+| **Upgrade** | Updates the `tag` value in `package.json` to the new Chromium version. |
+| **Conflict-resolved patches** | Contains manually resolved versions of any patches that failed to apply cleanly with `pnpm run init`. |
+| **Update patches** | Contains regenerated versions of all remaining patches that applied cleanly but whose context lines changed. |
+| **Updated strings** | Contains regenerated `.grd`, `.grdp`, and `.xtb` localization files under the new Chromium tag. |
+
+These four commits make the version bump easy to review in isolation: reviewers can quickly identify which patches needed human intervention, which changed mechanically, and whether any string changes are surprising.
+
+## Step-by-Step Upgrade Workflow
+
+<Steps>
+
+### Create a branch and update package.json
+
+Branch names conventionally use the major Chromium version number:
+
+```bash
+git checkout -b cr121 origin/master
+```
+
+Edit `package.json` to set the new `tag` value, then commit it with a message that records both the old and new version:
+
+```bash
+git add package.json
+git commit -m "Update from Chromium 119.7049.17 to Chromium 120.0.7050.40."
+```
+
+### Run init to check out the new tag and apply patches
+
+`pnpm run init` checks out the Chromium tag specified in `package.json`, then attempts to apply all patches from `src/brave/patches/`:
+
+```bash
+pnpm run init
+```
+
+If all patches apply cleanly, skip to [Updating all patches](#step-4-update-all-remaining-patches). If any patches fail, the output lists the affected files:
+
+```
+2 failed patches:
+chrome/browser/ui/views/frame/browser_view_layout.cc
+  - Error - Program git exited with error code 1.
+error: patch failed: chrome/browser/ui/views/frame/browser_view_layout.cc:72
+error: chrome/browser/ui/views/frame/browser_view_layout.cc: patch does not apply
+
+chrome/browser/ui/webui/settings/site_settings_helper.cc
+  - Error - Program git exited with error code 1.
+error: patch failed: chrome/browser/ui/webui/settings/site_settings_helper.cc:248
+error: chrome/browser/ui/webui/settings/site_settings_helper.cc: patch does not apply
+```
+
+### Resolve patch conflicts with --3way
+
+For each failing source file, derive the patch file name by replacing path separators with dashes and appending `.patch`. Then apply with `--3way` to get conflict markers:
+
+```bash
+# Source file path → patch file name:
+# chrome/browser/ui/views/frame/browser_view_layout.cc
+# → brave/patches/chrome-browser-ui-views-frame-browser_view_layout.cc.patch
+
+git -C ../ apply --3way --ignore-space-change --ignore-whitespace \
+    brave/patches/chrome-browser-ui-views-frame-browser_view_layout.cc.patch \
+    brave/patches/chrome-browser-ui-webui-settings-site_settings_helper.cc.patch
+```
+
+The output confirms which files received conflict markers:
+
+```
+Applied patch to 'chrome/browser/ui/views/frame/browser_view_layout.cc' with conflicts.
+U chrome/browser/ui/views/frame/browser_view_layout.cc
+Applied patch to 'chrome/browser/ui/webui/settings/site_settings_helper.cc' with conflicts.
+U chrome/browser/ui/webui/settings/site_settings_helper.cc
+```
+
+Open each file in your editor, resolve the conflict markers, and save. Then reset the git index to avoid issues when regenerating patches:
+
+```bash
+git -C ../ reset HEAD
+```
+
+<Warning>
+  If patches fail in repositories other than `chromium/src` (for example, `v8` or `devtools-frontend`), you must run both `reset` and `apply --3way` for those repositories too. The same `--3way` workflow applies.
+</Warning>
+
+### Regenerate the conflict-resolved patches and commit
+
+Once all merge conflicts are resolved, regenerate the patch files and commit only the conflict-resolved ones:
+
+```bash
+pnpm run update_patches
+
+git add patches/chrome-browser-ui-views-frame-browser_view_layout.cc.patch
+git add patches/chrome-browser-ui-webui-settings-site_settings_helper.cc.patch
+git commit -m " Conflict-resolved patches from Chromium 119.7049.17 to Chromium 120.0.7050.40."
+```
+
+<Note>
+  If a patch cannot be applied because the file it targeted has been deleted or renamed upstream, commit the patch removal as its own separate change — outside the "Conflict-resolved patches" commit. This makes it easier for reviewers to understand why a patch disappeared.
+</Note>
+
+### Update all remaining patches
+
+With conflict-resolved patches already committed, regenerate all remaining patches whose context lines changed but content is still valid:
+
+```bash
+pnpm run update_patches
+```
+
+Stage and commit all changed patch files:
+
+```bash
+git add -u *.patch
+git commit -m " Update patches from Chromium 119.7049.17 to Chromium 120.0.7050.40."
+```
+
+Run `init` again to confirm every patch applies cleanly on the new tag:
+
+```bash
+pnpm run init
+```
+
+### Regenerate localization strings
+
+Chromium ships updated string files with each release. Regenerate the Brave copies:
+
+```bash
+pnpm run chromium_rebase_l10n
+
+git add *.grdp *.grd *.xtb
+git commit -m " Updated strings for Chromium 120.0.7050.40."
+```
+
+This concludes the infrastructure portion of the version bump. The branch is now ready for a build run to identify and fix any remaining compilation failures caused by upstream API changes.
+
+</Steps>
+
+## Handling Deleted or Broken Patches
+
+Some patches become permanently invalid when upstream removes or renames the source file they target, or when the logic they modified is restructured so completely that the patch no longer makes sense.
+
+<Accordion title="Deleting a patch for a removed file">
+  Commit the patch deletion as a standalone change with a clear commit message explaining that the upstream file no longer exists and the patch is therefore dropped. Do not bundle these removals into the "Conflict-resolved patches" commit — keeping them separate helps reviewers understand each change in isolation.
+</Accordion>
+
+<Accordion title="Patch for a renamed file">
+  If a source file was renamed upstream, the old patch filename is no longer valid. Delete the old patch, make your change against the new file, regenerate the patch, and commit the rename as its own change with a note explaining what upstream renamed.
+</Accordion>
+
+## Using Brockit for Automation
+
+All production version bumps at Brave are performed with **🚀 Brockit!**, an automation layer built on top of the `pnpm run` commands described above. Understanding the manual steps in this guide is important for diagnosing Brockit failures and for performing patches-only fix-up work after a bump lands.
+
+<Tip>
+  Even when using Brockit, the manual workflow described here is the correct recovery path whenever automated application of a patch fails. Familiarity with `git apply --3way`, `pnpm run update_patches`, and `pnpm run chromium_rebase_l10n` is essential for anyone working on version bumps.
+</Tip>
+
+## Quick Reference
+
+| Command | When to run |
+|---------|-------------|
+| `pnpm run init` | After updating `package.json`; checks out the new tag and applies all patches |
+| `pnpm run apply_patches` | After switching branches where `.patch` files changed |
+| `pnpm run update_patches` | After resolving conflicts or making changes in `src/`; regenerates patch files |
+| `pnpm run chromium_rebase_l10n` | After all patches are green; regenerates `.grd`, `.grdp`, and `.xtb` string files |
+| `git -C ../ apply --3way --ignore-space-change --ignore-whitespace <patch>` | When a patch fails to apply cleanly and needs manual conflict resolution |
+| `git -C ../ reset HEAD` | After `--3way` resolution; resets the index before patch regeneration |

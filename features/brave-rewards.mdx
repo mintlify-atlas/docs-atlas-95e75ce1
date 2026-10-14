@@ -1,0 +1,218 @@
+---
+title: "Brave Rewards: Privacy-Preserving User Reward System"
+sidebarTitle: "Brave Rewards"
+description: "How Brave Rewards distributes BAT tokens to users and creators using VOPRF anonymous credentials, blind signing, and a Mojo-based engine architecture."
+---
+
+Brave Rewards enables users to earn Basic Attention Token (BAT) by opting in to privacy-respecting ads, then automatically contribute those earnings to verified web publishers and content creators — all without Brave ever learning which sites a user visits or how much they tip. The system achieves this separation of payment identity from usage through a VOPRF-based anonymous credential protocol and a layered, process-isolated engine architecture built inside Brave Core.
+
+## How Brave Rewards Works
+
+At its core, Brave Rewards connects three parties: the **user** who earns BAT by viewing ads, **publishers** who receive contributions, and the **Brave Rewards ledger** that verifies creator status and settles payouts. The design goal is that no single party can cross-correlate user attention with payment identity.
+
+<Steps>
+
+### User opts in to Rewards
+
+When a user creates a Rewards wallet (via `RewardsService::CreateRewardsWallet`), Brave generates a local cryptographic wallet keyed to the user's profile. Ads are enabled, and the engine begins tracking publisher page visits to compute attention scores.
+
+```cpp
+// components/brave_rewards/content/rewards_service.h
+virtual void CreateRewardsWallet(const std::string& country,
+                                 CreateRewardsWalletCallback callback) = 0;
+```
+
+### Publisher visits are tracked locally
+
+The `RewardsEngine` records publisher page visits through `NotifyPublisherPageVisit`, accumulating visit time and frequency to produce an attention weight. The engine enforces configurable minimums — a minimum visit time (seconds) and a minimum number of visits — before a publisher is eligible to receive contributions.
+
+```cpp
+void NotifyPublisherPageVisit(uint64_t tab_id,
+                              mojom::VisitDataPtr visit_data,
+                              const std::string& publisher_blob) override;
+
+void GetPublisherMinVisitTime(
+    GetPublisherMinVisitTimeCallback callback) override;
+void GetPublisherMinVisits(
+    GetPublisherMinVisitsCallback callback) override;
+```
+
+### Anonymous credentials are obtained via VOPRF
+
+Before any contribution is sent, the engine acquires anonymous credentials through a Verifiable Oblivious Pseudorandom Function (VOPRF, RFC 9497) blind-signing protocol implemented in `components/brave_rewards/core/engine/credentials/`. The client generates random tokens locally, blinds them, sends only the blinded versions to the server, receives blind signatures, verifies a DLEQ batch proof, then unblinds — resulting in tokens the server can later verify but cannot link to the original request.
+
+```cpp
+// components/brave_rewards/core/engine/credentials/credentials.h
+class Credentials {
+ public:
+  virtual void Start(const CredentialsTrigger& trigger,
+                     ResultCallback callback) = 0;
+
+  virtual void RedeemTokens(const CredentialsRedeem& redeem,
+                            ResultCallback callback) = 0;
+
+ protected:
+  virtual void Blind(ResultCallback callback,
+                     const CredentialsTrigger& trigger) = 0;
+  virtual void Claim(ResultCallback callback,
+                     const CredentialsTrigger& trigger,
+                     mojom::CredsBatchPtr creds) = 0;
+  virtual void Unblind(ResultCallback callback,
+                       const CredentialsTrigger& trigger,
+                       mojom::CredsBatchPtr creds) = 0;
+  virtual void Completed(ResultCallback callback,
+                         const CredentialsTrigger& trigger,
+                         mojom::Result result) = 0;
+};
+```
+
+### Contributions are sent or tipped
+
+The contribution subsystem (in `engine/contribution/`) handles both automated monthly contributions and one-time tips. `SendContribution` routes through `Contribution` and, for custodial wallets, `ContributionExternalWallet` to settle payouts via partners such as Uphold, bitFlyer, or ZebPay.
+
+```cpp
+void SendContribution(const std::string& publisher_id,
+                      double amount,
+                      bool set_monthly,
+                      SendContributionCallback callback) override;
+```
+
+</Steps>
+
+## VOPRF Anonymous Credentials
+
+Brave Rewards implements anonymous credentials conforming to **RFC 9497 (VOPRF)** to guarantee that the credential issuer cannot link issued tokens to their later redemption. This is the same cryptographic foundation shared by Brave's VPN and Leo premium credential system (see the [Privacy Pass credential system](/features/brave-vpn#privacy-pass-credential-system)).
+
+<CardGroup cols={2}>
+  <Card title="Blind Phase" icon="eye-slash">
+    Tokens are generated with a cryptographic RNG on the client. Only the cryptographically blinded versions are transmitted to Brave's signing server, preventing server-side deanonymization at issuance time.
+  </Card>
+  <Card title="Claim Phase" icon="check">
+    The signing server issues blind signatures and a DLEQ batch proof over the blinded tokens. The client verifies the proof against the issuer's public key before accepting.
+  </Card>
+  <Card title="Unblind Phase" icon="unlock">
+    The client removes the blinding factor locally, producing tokens that carry a valid server signature but are unlinkable to the original signing request.
+  </Card>
+  <Card title="Redeem Phase" icon="coins">
+    Unblinded tokens are presented as anonymous credentials to confirm ad events or unlock services. The server verifies the signature and checks for double-spend in its redemption store.
+  </Card>
+</CardGroup>
+
+<Note>
+  The VOPRF protocol is implemented in the open-source
+  [challenge-bypass-ristretto](https://github.com/brave-intl/challenge-bypass-ristretto)
+  library, which Brave Core links via the `components/skus/` SKUs SDK.
+</Note>
+
+## Engine Architecture
+
+The Rewards system is split into two layers that communicate exclusively over **Mojo IPC**, enabling the core logic to run in a sandboxed utility process:
+
+### `RewardsEngine` (core, process-isolated)
+
+`RewardsEngine` in `components/brave_rewards/core/engine/` is the authoritative implementation of the `mojom::RewardsEngine` interface. It owns all domain logic and state, and is composed of focused subsystem objects:
+
+| Subsystem | Class | Responsibility |
+|---|---|---|
+| Publisher tracking | `publisher::Publisher` | Visits, attention scoring, exclusion lists |
+| Media attribution | `Media` | YouTube, Twitch, and Twitter creator detection |
+| Contributions | `contribution::Contribution` | Monthly and one-time BAT contributions |
+| Wallet management | `wallet::Wallet` | Rewards wallet creation and recovery |
+| Credential management | `credential::Credentials` | VOPRF blind/claim/unblind/redeem cycle |
+| Database | `database::Database` | Local encrypted SQLite persistence |
+| External wallets | `Uphold`, `Bitflyer`, `ZebPay` | Custodial wallet integrations |
+
+```cpp
+// components/brave_rewards/core/engine/rewards_engine.h
+class RewardsEngine : public mojom::RewardsEngine,
+                      private base::SupportsUserData {
+ public:
+  publisher::Publisher* publisher()   { return publisher_.get(); }
+  Media*                media()       { return media_.get(); }
+  contribution::Contribution* contribution() { return contribution_.get(); }
+  wallet::Wallet*       wallet()      { return wallet_.get(); }
+  bitflyer::Bitflyer*   bitflyer()    { return bitflyer_.get(); }
+  uphold::Uphold*       uphold()      { return uphold_.get(); }
+  zebpay::ZebPay*       zebpay()      { return zebpay_.get(); }
+
+  // Get-or-create a helper (extended via SupportsUserData)
+  template <typename T>
+  T& Get();
+ private:
+  std::unique_ptr<database::Database> database_;
+  base::OneShotEvent ready_event_;
+};
+```
+
+### `RewardsService` (browser process)
+
+`RewardsService` in `components/brave_rewards/content/` is a `KeyedService` that lives in the browser process and serves as the public API surface for all UI and browser-level consumers. It marshals calls across the Mojo boundary to `RewardsEngine` and owns notification delivery, P3A instrumentation, and the diagnostic log.
+
+```cpp
+// components/brave_rewards/content/rewards_service.h
+class RewardsService : public KeyedService {
+ public:
+  virtual void FetchBalance(FetchBalanceCallback callback) = 0;
+  virtual void GetExternalWallet(GetExternalWalletCallback callback) = 0;
+  virtual void SendContribution(const std::string& publisher_id,
+                                double amount,
+                                bool set_monthly,
+                                base::OnceCallback<void(bool)> callback) = 0;
+  virtual p3a::ConversionMonitor* GetP3AConversionMonitor() = 0;
+};
+```
+
+## Component Structure
+
+```
+components/brave_rewards/
+├── core/                   # Shared, Content-API-independent code
+│   ├── engine/             # RewardsEngine + all domain subsystems
+│   │   ├── credentials/    # VOPRF blind-sign cycle
+│   │   ├── contribution/   # Monthly + one-time contributions
+│   │   ├── publisher/      # Attention scoring, prefix-list lookups
+│   │   ├── database/       # Local SQLite persistence
+│   │   ├── endpoint/       # HTTP client for Rewards APIs
+│   │   └── notifications/  # In-engine notification dispatch
+│   ├── mojom/              # Mojo interface definitions
+│   └── features.h          # Feature flags
+├── content/                # Browser-process layer
+│   ├── rewards_service.h   # Public KeyedService API
+│   ├── rewards_service_impl.cc
+│   └── rewards_p3a.cc      # Privacy-preserving analytics
+└── resources/              # UI assets and string resources
+```
+
+## Privacy Properties
+
+<Accordion title="No browsing data leaves the device">
+  Publisher attention scores are computed locally by the engine. The `NotifyPublisherPageVisit` calls never send URL data to Brave servers; only the eventual contribution amounts (and only in aggregated, anonymized form) interact with the ledger.
+</Accordion>
+
+<Accordion title="Anonymous BAT contributions via blind signatures">
+  BAT contributions use the VOPRF credential pipeline so that the signing server cannot link a credential issuance to its later redemption. Payment identity and service usage are cryptographically decoupled.
+</Accordion>
+
+<Accordion title="P3A telemetry is k-anonymous">
+  The `rewards_p3a.cc` module reports aggregate metrics through Brave's P3A pipeline, which uses PPOPRF and Shamir Secret Sharing via the STAR protocol to provide k-anonymity to all participating clients. No individual usage pattern is distinguishable.
+</Accordion>
+
+## Running Tests
+
+<Tabs>
+  <Tab title="Browser Tests">
+    ```bash
+    pnpm test brave_browser_tests --filter=BraveRewards*
+    ```
+  </Tab>
+  <Tab title="Unit Tests">
+    ```bash
+    pnpm test brave_unit_tests --filter=BraveRewards*
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+  Enable verbose Rewards logging at `brave://flags/#brave-rewards-verbose-logging`
+  and inspect the result on the **Logs** tab of `brave://rewards-internals`.
+</Tip>

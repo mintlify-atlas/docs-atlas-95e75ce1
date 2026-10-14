@@ -1,0 +1,138 @@
+---
+title: "Integrating Rust Code into Brave Core"
+sidebarTitle: "Rust Integration"
+description: "Rules, approval process, and tooling for adding Rust to brave-core: cxx.rs FFI, adblock-rust as a real example, vendoring crates, patching, and reviewer checklist."
+---
+
+Brave Core integrates Rust code for performance-critical components, most notably the adblock engine. Adding Rust to brave-core is possible but involves a formal approval process, strict rules around networking and duplication, and careful use of the cxx.rs FFI layer to bridge between Rust and C++. This page covers everything you need to know before writing or reviewing Rust code in the repository.
+
+## Rules for Adding Rust
+
+Before writing a line of Rust, verify that your addition satisfies all of the following requirements:
+
+<CardGroup cols={2}>
+  <Card title="Use Chromium's network stack" icon="globe">
+    All networking must go through Chromium's networking stack. Rust crates that implement their own HTTP client or TLS are not permitted.
+  </Card>
+  <Card title="No duplication with Chromium" icon="copy">
+    If Chromium already provides equivalent functionality — even in C++ — the new Rust code must not duplicate it. Check `third_party/` and Chromium's component list first.
+  </Card>
+  <Card title="Formal dependency approval" icon="shield-check">
+    Every new crate (and every crate it pulls in transitively) must be approved via an issue at [brave/reviews](https://github.com/brave/reviews/issues/new/choose) before merging.
+  </Card>
+  <Card title="Version alignment" icon="code-branch">
+    Look at existing crates in `third_party/rust` and match versions whenever possible. Duplicate copies of the same library are actively discouraged.
+  </Card>
+</CardGroup>
+
+<Note>
+Chromium's upstream guidance at [Adding to Third Party — Rust](https://chromium.googlesource.com/chromium/src/+/main/docs/adding_to_third_party.md#rust) applies in full to brave-core Rust code. Read it before submitting.
+</Note>
+
+## C++/Rust FFI with cxx.rs
+
+Brave uses [cxx.rs](https://cxx.rs) for all Rust ↔ C++ foreign function interface (FFI) boundaries. cxx.rs generates safe bridge code from a shared interface definition, avoiding the need to write `unsafe extern "C"` bindings manually.
+
+The adblock engine is the canonical real-world example. Its FFI boundary lives at:
+
+```
+components/brave_shields/core/common/adblock/rs/
+```
+
+Study that directory to understand how a production Brave Rust component is structured, including how the `BUILD.gn` is organized, how the bridge header is generated, and how C++ calls into Rust.
+
+<Tip>
+Before writing FFI code, read the [String Usage in Rust/C++ FFI](https://github.com/brave/brave-core/blob/master/docs/best-practices/coding-standards-apis.md#-string-usage-in-rustc-ffi) coding standard. String ownership across the FFI boundary is a common source of bugs.
+</Tip>
+
+## Vendoring and Managing Crates
+
+Brave uses a vendored Rust dependency model: all crates are checked into `third_party/rust/chromium_crates_io/`. The `gnrt` tool manages crate metadata and `BUILD.gn` generation.
+
+### Updating a Single Vendored Tool Crate
+
+The `tools/crates/` directory vendors Rust CLI tools (`cargo-audit`, `wasm-bindgen-cli`, `wasm-opt`, `wasm-pack`). To update a single transitive dependency (for example, in response to a security advisory) without re-vendoring everything:
+
+```sh
+pnpm run update_brave_tools_crates --update-crate=<name>@<version>
+```
+
+This downloads the crate from crates.io and patches only the targeted `vendor/` subdirectory and the `Cargo.lock` entry. To do a full re-vendor of all tool crates, run without arguments:
+
+```sh
+pnpm run update_brave_tools_crates
+```
+
+### Patching a Crate
+
+Sometimes a crate needs a source-level patch — for example, to remove `autocfg` usage that breaks the non-cargo build. Patches live in `third_party/rust/chromium_crates_io/patches/<crate-name>/`.
+
+To create a patch, make your changes inside the vendored crate directory and run `git format-patch`:
+
+```sh
+git format-patch \
+    --start-number=101 \
+    --src-prefix=a/brave/ \
+    --dst-prefix=b/brave/ \
+    --output-directory \
+        third_party/rust/chromium_crates_io/patches/some-crate/ \
+    HEAD^
+```
+
+For full instructions on patch creation in upstream Chromium's vendored Rust, see the [chromium_crates_io patches README](https://chromium.googlesource.com/chromium/src/+/HEAD/third_party/rust/chromium_crates_io/patches/README.md#steps-for-creating-new-patches).
+
+### Testing an Unreleased Dependency Version
+
+`gnrt` normally only accepts published crates from [crates.io](https://crates.io). For Brave-maintained crates that you want to test before an official release, add a `[patch]` section to `brave/third_party/rust/chromium_crates_io/Cargo.toml`:
+
+```toml
+[patch.crates-io]
+my-brave-crate = { path = "/path/to/local/checkout" }
+# or
+my-brave-crate = { git = "https://github.com/brave/my-crate", branch = "dev" }
+```
+
+After editing `Cargo.toml`, run `gnrt gen` to update the build graph. Note that vendored source files are **not** updated automatically — you must copy code changes into the vendor directory manually.
+
+## Updating the adblock Crate (Real Example)
+
+The adblock crate is the most frequently updated Rust dependency in brave-core. These two PRs illustrate the typical change pattern:
+
+- **Patch version update** (no API changes): [PR #20113](https://github.com/brave/brave-core/pull/20113/files) — updates `adblock 0.8.0` to `adblock 0.8.1`.
+- **Minor version update** (with API changes): [PR #19648](https://github.com/brave/brave-core/pull/19648/files) — updates `adblock 0.7` to `adblock 0.8`, including a path change in `components/brave_shields/adblock/rs/BUILD.gn` and upstream API adjustments.
+
+## Reviewer Checklist
+
+When reviewing a PR that adds or updates Rust code, check all of the following:
+
+<Accordion title="Dependency version alignment">
+  Third-party dependency versions should match what is already in the upstream Chromium tree or the existing Brave tree. If a new version is needed, confirm there is an open issue for all other consumers to coordinate migration — shipping duplicate crate versions is strongly discouraged.
+</Accordion>
+
+<Accordion title="Thread-local variable safety">
+  Carefully audit any `thread_local` usage. Rust code in brave-core may be called from different C++ threads in sequence, meaning thread-local variables will not hold consistent state across calls.
+</Accordion>
+
+<Accordion title="No I/O or system calls">
+  Rust code in brave-core must not perform file I/O or system calls. All I/O must go through C++ and Chromium's abstractions.
+</Accordion>
+
+<Accordion title="autocfg and cargo build script removal">
+  Any use of `autocfg` in a dependency must be patched out. Replace `autocfg` compile-time checks with explicit `config()` settings in `BUILD.gn` based on GN variables. The standard cargo build script detection does not work in Chromium's GN/Ninja build system and will either fail or produce wrong values.
+
+  See [this commit](https://github.com/brave/brave-core/commit/29fc07ef291593b5c4b9b2587ca184ab3d890650) for a worked example.
+</Accordion>
+
+<Accordion title="Approval via brave/reviews">
+  Confirm that all new transitive dependencies (not just the direct one) have been approved via a [brave/reviews](https://github.com/brave/reviews/issues/new/choose) issue before the PR merges.
+</Accordion>
+
+## String Usage Across the FFI Boundary
+
+Passing strings between Rust and C++ requires care. The cxx.rs bridge provides safe string types (`CxxString` and `RustString`) but you must follow the coding standard to avoid copies and lifetime issues. Key rules:
+
+- Prefer passing `&str` (Rust) ↔ `const std::string&` (C++) where the callee only reads the value.
+- Avoid returning owned `String` from Rust to C++ in hot paths — prefer output parameters or pre-allocated buffers.
+- Never transmit raw `*const u8` pointers without an accompanying length.
+
+Full guidance is in the [Rust/C++ FFI string coding standard](https://github.com/brave/brave-core/blob/master/docs/best-practices/coding-standards-apis.md#-string-usage-in-rustc-ffi).
